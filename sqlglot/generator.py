@@ -4588,8 +4588,23 @@ class Generator:
     def lte_sql(self, expression: exp.LTE) -> str:
         return self.binary(expression, "<=")
 
+    def mod_needs_paren(self, expression: exp.Mod) -> bool:
+        parent = expression.parent
+        return (
+            isinstance(parent, (exp.Mul, exp.Div, exp.IntDiv, exp.Mod))
+            and parent.expression is expression
+        )
+
+    def mod_operator_sql(self, expression: exp.Mod, operator: str) -> str:
+        sql = (
+            f"{self.sql(expression, 'this')}"
+            f" {self.maybe_comment(operator, comments=expression.comments)} "
+            f"{self.sql(expression, 'expression')}"
+        )
+        return f"({sql})" if self.mod_needs_paren(expression) else sql
+
     def mod_sql(self, expression: exp.Mod) -> str:
-        return self.binary(expression, "%")
+        return self.mod_operator_sql(expression, "%")
 
     def mul_sql(self, expression: exp.Mul) -> str:
         return self.binary(expression, "*")

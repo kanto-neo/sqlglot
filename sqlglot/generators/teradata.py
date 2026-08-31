@@ -128,7 +128,7 @@ class TeradataGenerator(generator.Generator):
         return self.prepend_ctes(expression, sql)
 
     def mod_sql(self, expression: exp.Mod) -> str:
-        return self.binary(expression, "MOD")
+        return self.mod_operator_sql(expression, "MOD")
 
     def rangen_sql(self, expression: exp.RangeN) -> str:
         this = self.sql(expression, "this")
