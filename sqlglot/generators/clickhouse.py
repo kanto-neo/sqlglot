@@ -167,6 +167,7 @@ class ClickHouseGenerator(generator.Generator):
     SELECT_KINDS: tuple[str, ...] = ()
     TRY_SUPPORTED = False
     SUPPORTS_UESCAPE = False
+    SUPPORTS_GROUPING_SETS_AS_GROUP_BY_ELEMENT = False
     SUPPORTS_DECODE_CASE = False
 
     AFTER_HAVING_MODIFIER_TRANSFORMS = generator.AFTER_HAVING_MODIFIER_TRANSFORMS
