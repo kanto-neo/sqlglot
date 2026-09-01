@@ -60,20 +60,20 @@ class TestHana(Validator):
                 "postgres": "SELECT CAST(a AS TEXT) FROM t",
             },
         )
-        # SECONDDATE is second-granular, so it must survive a HANA round trip rather than
-        # widening to TIMESTAMP.
-        self.validate_identity("SELECT CAST(a AS SECONDDATE) FROM t")
+        # SECONDDATE widens to TIMESTAMP on purpose. sqlglot's TIMESTAMP_S would preserve the
+        # second granularity but is a DuckDB-only spelling, so every other target would emit an
+        # unparseable TIMESTAMP_S. Assert a NON-duckdb target so the trade stays visible.
         self.validate_all(
             "SELECT CAST(a AS SECONDDATE) FROM t",
-            read={"duckdb": "SELECT CAST(a AS TIMESTAMP_S) FROM t"},
             write={
-                "hana": "SELECT CAST(a AS SECONDDATE) FROM t",
-                "duckdb": "SELECT CAST(a AS TIMESTAMP_S) FROM t",
+                "hana": "SELECT CAST(a AS TIMESTAMP) FROM t",
+                "postgres": "SELECT CAST(a AS TIMESTAMP) FROM t",
+                "oracle": "SELECT CAST(a AS TIMESTAMP) FROM t",
             },
         )
         self.validate_identity("SELECT CAST(a AS TIMESTAMP) FROM t")
         self.validate_identity("SELECT CAST(a AS NVARCHAR(10)) FROM t")
-        self.validate_identity("SELECT CAST(a AS VARBINARY) FROM t")
+        self.validate_identity("SELECT CAST(a AS VARBINARY(10)) FROM t")
         self.validate_identity("SELECT CAST(a AS DECIMAL(10, 2)) FROM t")
         self.validate_identity("SELECT CAST(a AS BOOLEAN) FROM t")
 
@@ -86,11 +86,12 @@ class TestHana(Validator):
             "SELECT CAST(a AS ALPHANUM) FROM t", "SELECT CAST(a AS VARCHAR) FROM t"
         )
 
-        # SAP HANA has no BINARY type; VARBINARY covers both.
+        # SAP HANA has no BINARY type, and a length-less VARBINARY is one byte, so an
+        # unbounded binary type becomes BLOB. See test_binary_types.
         self.validate_all(
-            "SELECT CAST(a AS VARBINARY) FROM t",
+            "SELECT CAST(a AS BLOB) FROM t",
             read={"postgres": "SELECT CAST(a AS BYTEA) FROM t"},
-            write={"hana": "SELECT CAST(a AS VARBINARY) FROM t"},
+            write={"hana": "SELECT CAST(a AS BLOB) FROM t"},
         )
         for source, expected in (
             ("DATETIME", "TIMESTAMP"),
@@ -324,10 +325,19 @@ class TestHana(Validator):
 
         # TRIM's ANSI form is supported in all four variants.
         self.validate_identity("SELECT TRIM(a) FROM t")
-        self.validate_identity("SELECT TRIM('x' FROM a) FROM t")
-        self.validate_identity("SELECT TRIM(BOTH 'x' FROM a) FROM t")
-        self.validate_identity("SELECT TRIM(LEADING 'x' FROM a) FROM t")
-        self.validate_identity("SELECT TRIM(TRAILING 'x' FROM a) FROM t")
+        self.validate_identity(
+            "SELECT TRIM('x' FROM a) FROM t", "SELECT LTRIM(RTRIM(a, 'x'), 'x') FROM t"
+        )
+        self.validate_identity(
+            "SELECT TRIM(BOTH 'x' FROM a) FROM t", "SELECT LTRIM(RTRIM(a, 'x'), 'x') FROM t"
+        )
+        # LEADING/TRAILING become HANA's own LTRIM/RTRIM, which carry the set semantics.
+        self.validate_identity(
+            "SELECT TRIM(LEADING 'x' FROM a) FROM t", "SELECT LTRIM(a, 'x') FROM t"
+        )
+        self.validate_identity(
+            "SELECT TRIM(TRAILING 'x' FROM a) FROM t", "SELECT RTRIM(a, 'x') FROM t"
+        )
 
     def test_mod(self):
         # HANA's arithmetic operators are only unary -, +, -, *, / — modulo is a function.
@@ -355,16 +365,10 @@ class TestHana(Validator):
 
     def test_hash_functions(self):
         # HASH_MD5 / HASH_SHA256 take a BINARY argument, hence the TO_BINARY wrapper.
-        self.validate_all(
-            "SELECT HASH_MD5(TO_BINARY(x)) FROM t",
-            read={"postgres": "SELECT MD5(x) FROM t"},
-            write={"hana": "SELECT HASH_MD5(TO_BINARY(x)) FROM t"},
-        )
-        self.validate_all(
-            "SELECT HASH_SHA256(TO_BINARY(x)) FROM t",
-            read={"postgres": "SELECT SHA256(x) FROM t"},
-            write={"hana": "SELECT HASH_SHA256(TO_BINARY(x)) FROM t"},
-        )
+        # The hex-wrapping round trip lives in test_hash_returns_hex; here only the bare HANA
+        # spellings, which stay anonymous and therefore an identity.
+        self.validate_identity("SELECT HASH_MD5(TO_BINARY(x)) FROM t")
+        self.validate_identity("SELECT HASH_SHA256(TO_BINARY(x)) FROM t")
         # HASH_MD5 and HASH_SHA256 are the only hash functions HANA documents.
         for length in (384, 512):
             with self.subTest(length=length):
@@ -437,3 +441,125 @@ class TestHana(Validator):
                         "duckdb"
                     ),
                 )
+
+    def test_trim_uses_set_semantics(self):
+        # HANA's LTRIM/RTRIM second argument is a character SET, not a search string:
+        # LTRIM('babababAabend', 'ab') is 'Aabend'. The shared ANSI trim_sql helper would emit
+        # TRIM(LEADING 'ab' FROM ...), which removes a SUBSTRING and returns a different value.
+        # A single-character set is the one case where the two agree, so it cannot be the only test.
+        self.validate_all(
+            "SELECT LTRIM('babababAabend', 'ab')",
+            read={"postgres": "SELECT LTRIM('babababAabend', 'ab')"},
+            write={"hana": "SELECT LTRIM('babababAabend', 'ab')"},
+        )
+        self.validate_all(
+            "SELECT RTRIM(a, 'xyz') FROM t",
+            read={"postgres": "SELECT RTRIM(a, 'xyz') FROM t"},
+            write={"hana": "SELECT RTRIM(a, 'xyz') FROM t"},
+        )
+        # BOTH has no two-argument TRIM in HANA, so it nests instead.
+        self.validate_all(
+            "SELECT LTRIM(RTRIM(x, 'ab'), 'ab')",
+            read={"bigquery": "SELECT TRIM(x, 'ab')"},
+            write={"hana": "SELECT LTRIM(RTRIM(x, 'ab'), 'ab')"},
+        )
+        for sql in ("SELECT LTRIM(a, 'ab') FROM t", "SELECT RTRIM(a, 'ab') FROM t"):
+            with self.subTest(sql=sql):
+                self.assertNotIn("TRIM(LEADING", parse_one(sql, read="hana").sql("hana"))
+                self.assertNotIn("TRIM(TRAILING", parse_one(sql, read="hana").sql("hana"))
+
+    def test_hash_returns_hex(self):
+        # HASH_MD5/HASH_SHA256 take BINARY and RETURN VARBINARY, but exp.MD5/exp.SHA2 denote the
+        # hex digest, so BINTOHEX is needed on the way out as well as TO_BINARY on the way in.
+        self.validate_all(
+            "SELECT BINTOHEX(HASH_MD5(TO_BINARY(x))) FROM t",
+            read={"postgres": "SELECT MD5(x) FROM t"},
+            write={"hana": "SELECT BINTOHEX(HASH_MD5(TO_BINARY(x))) FROM t"},
+        )
+        self.validate_all(
+            "SELECT BINTOHEX(HASH_SHA256(TO_BINARY(x))) FROM t",
+            read={"postgres": "SELECT SHA256(x) FROM t"},
+            write={"hana": "SELECT BINTOHEX(HASH_SHA256(TO_BINARY(x))) FROM t"},
+        )
+
+    def test_binary_types(self):
+        # A VARBINARY with no length is a ONE-BYTE column in HANA, so unbounded binary is BLOB.
+        self.validate_all(
+            "CREATE TABLE t (b BLOB)",
+            read={"postgres": "CREATE TABLE t (b BYTEA)", "hana": "CREATE TABLE t (b BLOB)"},
+            write={"hana": "CREATE TABLE t (b BLOB)"},
+        )
+        # An explicit length is preserved rather than routed to BLOB.
+        self.validate_identity("SELECT CAST(a AS VARBINARY(10)) FROM t")
+        # Hex literals must not be swallowed: `0x0abc` once parsed as `0 AS x0abc`.
+        self.validate_identity("SELECT x'0abc'")
+        self.validate_identity("SELECT 0x0abc", "SELECT x'0abc'")
+
+    def test_constructs_hana_lacks(self):
+        # Each of these has no HANA grammar and must be rewritten, not emitted verbatim.
+        self.validate_all(
+            "SELECT CAST(a AS INT)",
+            read={"tsql": "SELECT TRY_CAST(a AS INT)"},
+            write={"hana": "SELECT CAST(a AS INT)"},
+        )
+        self.validate_all(
+            "SELECT a FROM t WHERE LOWER(b) LIKE LOWER('x%')",
+            read={"postgres": "SELECT a FROM t WHERE b ILIKE 'x%'"},
+            write={"hana": "SELECT a FROM t WHERE LOWER(b) LIKE LOWER('x%')"},
+        )
+        for name, sql, read in (
+            ("qualify", "SELECT a FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY b) = 1", "snowflake"),
+            ("semi join", "SELECT * FROM a LEFT SEMI JOIN b ON a.x = b.x", "spark"),
+            ("distinct on", "SELECT DISTINCT ON (a) a, b FROM t", "postgres"),
+        ):
+            with self.subTest(construct=name):
+                out = parse_one(sql, read=read).sql("hana")
+                for banned in ("QUALIFY", "SEMI JOIN", "DISTINCT ON", "TRY_CAST", "ILIKE"):
+                    self.assertNotIn(banned, out)
+
+    def test_quarter_is_an_integer(self):
+        # HANA's QUARTER() returns the string 'YYYY-Qn' and EXTRACT(QUARTER ...) is a syntax
+        # error, so an integer quarter has to be computed. FLOOR matters: HANA's / is true
+        # division, so without it two months per quarter would yield a fraction.
+        self.validate_all(
+            "SELECT (FLOOR((MONTH(d) - 1) / 3) + 1) FROM t",
+            read={"postgres": "SELECT EXTRACT(QUARTER FROM d) FROM t"},
+            write={"hana": "SELECT (FLOOR((MONTH(d) - 1) / 3) + 1) FROM t"},
+        )
+        self.assertNotIn("QUARTER", parse_one("SELECT QUARTER(d)", read="mysql").sql("hana"))
+        # ISOWEEK also returns a string in HANA, so it has no integer equivalent and must warn.
+        self.validate_all(
+            "SELECT EXTRACT(ISOWEEK FROM d) FROM t",
+            write={"hana": UnsupportedError},
+        )
+
+    def test_group_concat_delimiter(self):
+        # HANA's STRING_AGG documents no default delimiter, so one must not be invented.
+        self.validate_identity("SELECT STRING_AGG(a) FROM t")
+        self.assertNotIn("','", parse_one("SELECT STRING_AGG(a) FROM t", read="hana").sql("hana"))
+        # DISTINCT has no place in HANA's STRING_AGG grammar.
+        self.validate_all(
+            "SELECT GROUP_CONCAT(DISTINCT a) FROM t",
+            write={"hana": UnsupportedError},
+        )
+
+    def test_full_date_delta_family(self):
+        # Every add/diff sibling must route through the HANA helpers; an unmapped one leaks a
+        # sqlglot-internal name such as TIME_ADD / DATETIME_DIFF / TIMESTAMPDIFF.
+        for sql, read in (
+            ("SELECT TIMESTAMPDIFF(SECOND, a, b)", "mysql"),
+            ("SELECT DATETIME_DIFF(a, b, SECOND)", "bigquery"),
+            ("SELECT TIME_ADD(t, INTERVAL 1 HOUR)", "bigquery"),
+            ("SELECT DATETIME_ADD(d, INTERVAL 1 DAY)", "bigquery"),
+        ):
+            with self.subTest(sql=sql):
+                out = parse_one(sql, read=read).sql("hana")
+                for banned in (
+                    "TIME_ADD",
+                    "TIME_DIFF",
+                    "DATETIME_ADD",
+                    "DATETIME_DIFF",
+                    "TIMESTAMPDIFF",
+                    "TIMESTAMPADD",
+                ):
+                    self.assertNotIn(banned, out, f"{sql} leaked {banned}: {out}")

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import typing as t
 
-from sqlglot import exp, generator
+from sqlglot import exp, generator, transforms
 from sqlglot.dialects.dialect import (
     concat_to_dpipe_sql,
     concat_ws_to_dpipe_sql,
     groupconcat_sql,
+    no_ilike_sql,
+    no_trycast_sql,
     rename_func,
-    trim_sql,
 )
 from sqlglot.parsers.hana import DATE_UNITS
 
@@ -24,10 +25,12 @@ MAX_LIMIT = 2147384648
 # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/extract-function-datetime
 EXTRACT_NATIVE_PARTS = {"YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"}
 
-# Parts EXTRACT rejects, but which HANA exposes as an integer-returning scalar function.
+# Parts EXTRACT rejects, but which HANA exposes as an INTEGER-returning scalar function.
+# ISOWEEK and QUARTER are deliberately absent: HANA's ISOWEEK returns 'YYYY-Www' and its QUARTER
+# returns 'YYYY-Qn', both strings, so neither can stand in for an integer date part.
+# HANA's WEEK is also not ISO-week numbered, which is noted where it is used.
 EXTRACT_FUNCTION_BY_PART = {
     "WEEK": "WEEK",
-    "ISOWEEK": "ISOWEEK",
     "DAYOFMONTH": "DAYOFMONTH",
     "DAYOFYEAR": "DAYOFYEAR",
     "DOY": "DAYOFYEAR",
@@ -41,13 +44,19 @@ SECONDS_PER_UNIT = {"HOUR": 3600, "MINUTE": 60}
 # pair of helpers. All are exp.Func subclasses carrying `this`, `expression` and `unit`.
 DateDelta = t.Union[
     exp.DateAdd,
+    exp.DateDiff,
     exp.DateSub,
     exp.DatetimeAdd,
+    exp.DatetimeDiff,
     exp.DatetimeSub,
+    exp.TimeAdd,
+    exp.TimeDiff,
     exp.TimeSub,
     exp.TimestampAdd,
+    exp.TimestampDiff,
     exp.TimestampSub,
     exp.TsOrDsAdd,
+    exp.TsOrDsDiff,
 ]
 
 
@@ -77,8 +86,62 @@ def _extract_sql(self: HanaGenerator, expression: exp.Extract) -> str:
     if func_name:
         return self.func(func_name, expression.expression)
 
+    if part == "QUARTER":
+        return self.sql(_quarter_expr(expression.expression))
+
     self.unsupported(f"EXTRACT part '{part}' is not supported in SAP HANA.")
     return generator.Generator.extract_sql(self, expression)
+
+
+def _quarter_expr(this: exp.Expr) -> exp.Expr:
+    """Compute an INTEGER quarter, since HANA's QUARTER() returns the string 'YYYY-Qn'.
+
+    FLOOR is required, not cosmetic: HANA's `/` is true division, so (MONTH - 1) / 3 yields a
+    fraction for two months in every quarter and the result would not be an integer at all.
+    """
+    month = exp.func("MONTH", this.copy())
+    divided = exp.Div(
+        this=exp.paren(month - exp.Literal.number(1)), expression=exp.Literal.number(3)
+    )
+    return exp.paren(exp.func("FLOOR", divided) + exp.Literal.number(1))
+
+
+def _quarter_sql(self: HanaGenerator, expression: exp.Quarter) -> str:
+    return self.sql(_quarter_expr(expression.this))
+
+
+def _trim_sql(self: HanaGenerator, expression: exp.Trim) -> str:
+    """Render exp.Trim with SAP HANA's set semantics.
+
+    HANA's LTRIM/RTRIM take a <remove_set>, "treated as a set of characters and not as a search
+    string" -- LTRIM('babababAabend', 'ab') is 'Aabend'. That matches what exp.Trim means, so the
+    base rendering is correct for LEADING and TRAILING and must NOT be replaced by the shared ANSI
+    trim_sql helper, which would emit substring semantics and quietly change the result.
+    Only BOTH needs handling: HANA has no two-argument TRIM(<str>, <set>).
+    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/ltrim-function-string
+    """
+    remove_set = expression.expression
+    position = self.sql(expression, "position")
+
+    # BOTH is the default, and may be either implicit or spelled out; both reach here.
+    if remove_set and position in ("", "BOTH"):
+        return self.func("LTRIM", self.func("RTRIM", expression.this, remove_set), remove_set)
+
+    return generator.Generator.trim_sql(self, expression)
+
+
+def _group_concat_sql(self: HanaGenerator, expression: exp.GroupConcat) -> str:
+    """Render exp.GroupConcat as STRING_AGG.
+
+    `sep=None` rather than the helper's ',' default: HANA's STRING_AGG documents no default
+    delimiter, so synthesising one would change the value of a HANA query that omitted it.
+    DISTINCT has no place in HANA's STRING_AGG grammar, so it is refused rather than emitted.
+    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/string-agg-function-aggregate
+    """
+    if isinstance(expression.this, exp.Distinct):
+        self.unsupported("SAP HANA's STRING_AGG does not support DISTINCT.")
+
+    return groupconcat_sql(self, expression, func_name="STRING_AGG", sep=None, within_group=False)
 
 
 def _repeat_sql(self: HanaGenerator, expression: exp.Repeat) -> str:
@@ -101,10 +164,20 @@ def _repeat_sql(self: HanaGenerator, expression: exp.Repeat) -> str:
     return self.func("RPAD", this, length, this.copy())
 
 
+def _hash_sql(self: HanaGenerator, func_name: str, this: exp.Expr) -> str:
+    """Render a hash as a hex STRING, which is what exp.MD5 / exp.SHA2 denote.
+
+    Two conversions are needed, in both directions: HASH_MD5 / HASH_SHA256 take a BINARY argument,
+    and they RETURN a VARBINARY, whereas every other dialect's MD5()/SHA2() returns the hex text.
+    BINTOHEX closes that second half -- without it the value is binary, not the hex digest, and
+    comparing it against a hex literal silently never matches.
+    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/hash-md5-function-miscellaneous
+    """
+    return self.func("BINTOHEX", exp.func(func_name, exp.func("TO_BINARY", this)))
+
+
 def _md5_sql(self: HanaGenerator, expression: exp.MD5) -> str:
-    # HASH_MD5 takes a BINARY argument, so the input has to be converted first.
-    # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/hash-md5-function-miscellaneous
-    return self.func("HASH_MD5", exp.func("TO_BINARY", expression.this))
+    return _hash_sql(self, "HASH_MD5", expression.this)
 
 
 def _sha2_sql(self: HanaGenerator, expression: exp.SHA2) -> str:
@@ -116,7 +189,7 @@ def _sha2_sql(self: HanaGenerator, expression: exp.SHA2) -> str:
         self.unsupported(f"SHA2 with length {length} is not supported in SAP HANA.")
         return self.function_fallback_sql(expression)
 
-    return self.func("HASH_SHA256", exp.func("TO_BINARY", expression.this))
+    return _hash_sql(self, "HASH_SHA256", expression.this)
 
 
 def _strposition_sql(self: HanaGenerator, expression: exp.StrPosition) -> str:
@@ -208,7 +281,7 @@ def _date_sub_sql(self: HanaGenerator, expression: DateDelta) -> str:
     )
 
 
-def _date_diff_sql(self: HanaGenerator, expression: exp.DateDiff | exp.TsOrDsDiff) -> str:
+def _date_diff_sql(self: HanaGenerator, expression: DateDelta) -> str:
     unit = expression.text("unit").upper() or "DAY"
 
     # <unit>S_BETWEEN(<start>, <end>) counts forward from the first argument, which is the
@@ -253,10 +326,18 @@ class HanaGenerator(generator.Generator):
     # ... but it does support locking reads, which the base default would silently discard.
     LOCKING_READS_SUPPORTED = True
 
+    # HANA's set operators take no ALL/DISTINCT qualifier, and it has neither TO_NUMBER nor NVL2.
+    EXCEPT_INTERSECT_SUPPORT_ALL_CLAUSE = False
+    SUPPORTS_TO_NUMBER = False
+    NVL2_SUPPORTED = False
+
     TYPE_MAPPING = {
         **generator.Generator.TYPE_MAPPING,
-        # SAP HANA has no BINARY type -- VARBINARY covers both.
+        # SAP HANA has no BINARY type -- VARBINARY covers both. Note a VARBINARY with no
+        # length is a ONE-BYTE column in HANA, so datatype_sql below routes the unbounded
+        # forms to BLOB instead.
         exp.DType.BINARY: "VARBINARY",
+        exp.DType.BLOB: "BLOB",
         exp.DType.DATETIME: "TIMESTAMP",
         # HANA's TEXT is a full-text search type, not a character type; NCLOB is the
         # unbounded string type. https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/data-types
@@ -280,6 +361,7 @@ class HanaGenerator(generator.Generator):
         exp.CurrentTimestamp: lambda *_: "CURRENT_TIMESTAMP",
         exp.DateAdd: _date_add_sql,
         exp.DateDiff: _date_diff_sql,
+        exp.DatetimeDiff: _date_diff_sql,
         exp.DateSub: _date_sub_sql,
         exp.DatetimeAdd: _date_add_sql,
         exp.DatetimeSub: _date_sub_sql,
@@ -291,27 +373,58 @@ class HanaGenerator(generator.Generator):
         exp.DayOfYear: rename_func("DAYOFYEAR"),
         exp.Extract: _extract_sql,
         # HANA's string aggregate is STRING_AGG; it has no GROUP_CONCAT.
-        exp.GroupConcat: lambda self, e: groupconcat_sql(
-            self, e, func_name="STRING_AGG", within_group=False
-        ),
+        exp.GroupConcat: _group_concat_sql,
+        # HANA has no ILIKE; the case-insensitive comparison has to be spelled out.
+        exp.ILike: no_ilike_sql,
         exp.MD5: _md5_sql,
         # HANA's arithmetic operators are only unary -, +, -, *, / -- modulo is a function.
         exp.Mod: rename_func("MOD"),
+        exp.Quarter: _quarter_sql,
         exp.Repeat: _repeat_sql,
         exp.SHA2: _sha2_sql,
         exp.StrPosition: _strposition_sql,
         exp.StrToDate: lambda self, e: self.func("TO_DATE", e.this, self.format_time(e)),
         exp.StrToTime: lambda self, e: self.func("TO_TIMESTAMP", e.this, self.format_time(e)),
         exp.TimeStrToTime: rename_func("TO_TIMESTAMP"),
+        exp.TimeAdd: _date_add_sql,
+        exp.TimeDiff: _date_diff_sql,
         exp.TimeSub: _date_sub_sql,
         exp.TimeToStr: _to_varchar_sql,
         exp.TimestampAdd: _date_add_sql,
+        exp.TimestampDiff: _date_diff_sql,
         exp.TimestampSub: _date_sub_sql,
         exp.ToChar: _to_varchar_sql,
-        exp.Trim: trim_sql,
+        exp.Trim: _trim_sql,
         exp.TsOrDsAdd: _date_add_sql,
         exp.TsOrDsDiff: _date_diff_sql,
+        # HANA has no TRY_CAST; TRY_SUPPORTED only gates exp.Try, not exp.TryCast.
+        exp.TryCast: no_trycast_sql,
+        # HANA has no WEEK_OF_YEAR -- the function is WEEK, same as the EXTRACT(WEEK) path.
+        exp.WeekOfYear: rename_func("WEEK"),
+        # QUALIFY, SEMI/ANTI joins and DISTINCT ON have no HANA grammar, so they are rewritten
+        # into constructs that do rather than emitted verbatim.
+        exp.Select: transforms.preprocess(
+            [
+                transforms.eliminate_distinct_on,
+                transforms.eliminate_qualify,
+                transforms.eliminate_semi_and_anti_joins,
+            ]
+        ),
     }
+
+    def datatype_sql(self, expression: exp.DataType) -> str:
+        """Route an unbounded binary type to BLOB.
+
+        SAP HANA's VARBINARY takes a length between 1 and 5000 and "if the length is not
+        specified, then the default is 1" -- so rendering an unbounded binary column as a bare
+        VARBINARY would declare a ONE-BYTE column and silently truncate. BLOB is the unbounded
+        binary type.
+        https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/binary-data-types
+        """
+        if expression.is_type(exp.DType.BINARY, exp.DType.VARBINARY) and not expression.expressions:
+            return "BLOB"
+
+        return super().datatype_sql(expression)
 
     def lock_sql(self, expression: exp.Lock) -> str:
         """Render exp.Lock using SAP HANA's spellings.
