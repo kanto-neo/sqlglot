@@ -602,6 +602,7 @@ x + interval '1' month
 | Dune | Community |
 | Exasol | Community |
 | Fabric | Community |
+| HANA | Community |
 | Hive | Official |
 | Materialize | Community |
 | MySQL | Official |
