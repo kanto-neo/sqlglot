@@ -11,6 +11,7 @@ from sqlglot.dialects.dialect import (
     build_timetostr_or_tochar,
 )
 from sqlglot.helper import seq_get
+from sqlglot.tokens import TokenType
 
 # SAP HANA exposes an ADD_<unit>S / <unit>S_BETWEEN pair for exactly these four units. The set is
 # much narrower than most engines': there is no ADD_HOURS, ADD_MINUTES, ADD_WEEKS, HOURS_BETWEEN,
@@ -43,7 +44,7 @@ def _build_date_diff(unit: str) -> t.Callable[[list], exp.DateDiff]:
 
 
 def _build_to_datetime(
-    exp_class: type[exp.StrToDate] | type[exp.StrToTime], func_name: str
+    exp_class: type[exp.StrToDate | exp.StrToTime], func_name: str
 ) -> t.Callable[[list, DialectType], exp.Expr]:
     """Build the TO_DATE / TO_TIMESTAMP parse functions, guarding the one-argument form.
 
@@ -81,6 +82,24 @@ class HanaParser(parser.Parser):
         # exp.StrPosition models. A negative <start_position> means "search right to left" in
         # HANA; that does not survive translation to dialects which emulate `position`.
         # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/locate-function-string
+        # HANA's array length function, paired with ARRAY_SIZE_NAME on the generator so the
+        # round trip is an identity rather than degrading to the default ARRAY_LENGTH.
+        "CARDINALITY": exp.ArraySize.from_arg_list,
+        # HANA's MAP(<expr>, <search1>, <result1>, ..., [<default>]) is a variadic CASE-like
+        # selector, nothing like the key/value map constructor exp.Map models -- and exp.Map
+        # caps at two arguments, so the base entry turns any real HANA MAP into a parse error.
+        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/map-function-miscellaneous
+        "MAP": lambda args: exp.Anonymous(this="MAP", expressions=args),
+        # HANA's NEXT_DAY takes ONE argument and means "the day after <date>", whereas
+        # exp.NextDay models Oracle's two-argument NEXT_DAY(<date>, <weekday>) and requires the
+        # second, so the base entry rejects valid HANA. Expressed as a day delta instead, which
+        # both round-trips as ADD_DAYS(<date>, 1) and carries the meaning to other dialects.
+        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/next-day-function-datetime
+        "NEXT_DAY": lambda args: exp.DateAdd(
+            this=seq_get(args, 0),
+            expression=exp.Literal.number(1),
+            unit=exp.Literal.string("DAY"),
+        ),
         "LOCATE": lambda args: exp.StrPosition(
             this=seq_get(args, 0),
             substr=seq_get(args, 1),
@@ -88,6 +107,25 @@ class HanaParser(parser.Parser):
             occurrence=seq_get(args, 3),
         ),
     }
+
+    RANGE_PARSERS = {
+        **parser.Parser.RANGE_PARSERS,
+        # LIKE_REGEXPR is tokenized as RLIKE (see the dialect's Tokenizer), but it carries an
+        # optional trailing FLAG that binary_range_parser would leave behind as a stray token.
+        TokenType.RLIKE: lambda self, this: self._parse_like_regexpr(this),
+    }
+
+    def _parse_like_regexpr(self, this: exp.Expr) -> exp.RegexpLike:
+        """Parse `<expr> LIKE_REGEXPR <pattern> [FLAG <flags>]`.
+
+        exp.RegexpLike already carries an optional `flag`, so the modifier survives the round
+        trip instead of being dropped or failing to parse.
+        https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/like-regexpr-predicate
+        """
+        expression = self._parse_bitwise()
+        flag = self._parse_string() if self._match_text_seq("FLAG") else None
+
+        return self.expression(exp.RegexpLike(this=this, expression=expression, flag=flag))
 
     def _parse_locks(self) -> list[exp.Lock]:
         """Parse SAP HANA's locking-read clauses.
