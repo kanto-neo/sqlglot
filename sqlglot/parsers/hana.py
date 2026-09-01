@@ -42,13 +42,24 @@ def _build_date_diff(unit: str) -> t.Callable[[list], exp.DateDiff]:
     return _builder
 
 
-def _build_to_timestamp(args: list, dialect: DialectType) -> exp.StrToTime | exp.Anonymous:
-    # TO_TIMESTAMP(<expr>) with no format model is a plain conversion, not a parse, so it must
-    # not become a StrToTime -- that would invent a format on the way back out.
-    if len(args) == 1:
-        return exp.Anonymous(this="TO_TIMESTAMP", expressions=args)
+def _build_to_datetime(
+    exp_class: type[exp.StrToDate] | type[exp.StrToTime], func_name: str
+) -> t.Callable[[list, DialectType], exp.Expr]:
+    """Build the TO_DATE / TO_TIMESTAMP parse functions, guarding the one-argument form.
 
-    return build_formatted_time(exp.StrToTime)(args, t.cast(Dialect, dialect))
+    TO_DATE(<expr>) / TO_TIMESTAMP(<expr>) with no format model is a plain conversion, not a
+    parse. Turning it into a StrToDate/StrToTime with format=None makes every target that
+    requires a format emit a call missing its mandatory argument (BigQuery PARSE_DATE(x),
+    DuckDB STRPTIME(x)). Left anonymous, the one-argument form round-trips correctly.
+    """
+
+    def _builder(args: list, dialect: DialectType) -> exp.Expr:
+        if len(args) == 1:
+            return exp.Anonymous(this=func_name, expressions=args)
+
+        return build_formatted_time(exp_class)(args, t.cast(Dialect, dialect))
+
+    return _builder
 
 
 class HanaParser(parser.Parser):
@@ -63,8 +74,8 @@ class HanaParser(parser.Parser):
         "TO_NVARCHAR": build_timetostr_or_tochar,
         # ... and TO_DATE / TO_TIMESTAMP are the inbound direction. Without these, HANA's own
         # format models leak out unconverted as Python strftime strings.
-        "TO_DATE": build_formatted_time(exp.StrToDate),
-        "TO_TIMESTAMP": _build_to_timestamp,
+        "TO_DATE": _build_to_datetime(exp.StrToDate, "TO_DATE"),
+        "TO_TIMESTAMP": _build_to_datetime(exp.StrToTime, "TO_TIMESTAMP"),
         # LOCATE(<haystack>, <needle>[, <start_position>[, <occurrences>]]) -- note the argument
         # order is the opposite of the ANSI POSITION(<needle> IN <haystack>) form that
         # exp.StrPosition models. A negative <start_position> means "search right to left" in
