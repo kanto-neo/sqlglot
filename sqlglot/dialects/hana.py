@@ -72,15 +72,25 @@ class Hana(Dialect):
         # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/identifiers
         IDENTIFIERS = ['"']
         QUOTES = ["'"]
+        # Without these, `SELECT 0x0abc` silently parses as `SELECT 0 AS x0abc`.
+        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/binary-data-types
+        HEX_STRINGS = [("x'", "'"), ("X'", "'"), ("0x", ""), ("0X", "")]
 
         KEYWORDS = {
             **tokens.Tokenizer.KEYWORDS,
             # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/data-types
             "ALPHANUM": TokenType.VARCHAR,
             "NCLOB": TokenType.TEXT,
-            # SECONDDATE is second-granular, so it maps to the second-granular type rather than
-            # to TIMESTAMP -- otherwise a HANA round trip silently widens the column.
-            "SECONDDATE": TokenType.TIMESTAMP_S,
+            # SECONDDATE is second-granular, and sqlglot has a TIMESTAMP_S type for exactly that.
+            # It is deliberately NOT used: TIMESTAMP_S is spelled that way only by DuckDB, so
+            # every other generator would render the raw enum name and hana -> postgres/oracle/tsql
+            # would emit an unparseable `TIMESTAMP_S`. Widening to TIMESTAMP loses sub-type
+            # precision on a HANA round trip but keeps every other target valid, which is the
+            # better trade for a dialect whose job is interop.
+            "SECONDDATE": TokenType.TIMESTAMP,
+            # HANA's VARBINARY defaults to ONE byte when no length is given, so the unbounded
+            # binary type is BLOB, not VARBINARY. The base tokenizer maps BLOB to VARBINARY.
+            "BLOB": TokenType.BLOB,
             # SMALLDECIMAL is a variable-precision decimal FLOAT (p 1-16); no sqlglot type models
             # that, so it degrades to DECIMAL (p 1-34). This round trip is deliberately not an
             # identity: the alternative, leaving it user-defined, leaks SMALLDECIMAL into every
