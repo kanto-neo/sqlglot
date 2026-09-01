@@ -96,6 +96,20 @@ class Hana(Dialect):
             # identity: the alternative, leaving it user-defined, leaks SMALLDECIMAL into every
             # other dialect, which is worse.
             "SMALLDECIMAL": TokenType.DECIMAL,
+            # A bare FLOAT is 64-bit in HANA -- i.e. it means DOUBLE -- while REAL is the
+            # 32-bit type. Every dialect parses REAL to DType.FLOAT, so FLOAT has to give up
+            # that slot or the two widths collapse into one and a REAL silently becomes 64-bit.
+            # FLOAT(<n>) is still round-tripped; see HanaGenerator.datatype_sql.
+            "FLOAT": TokenType.DOUBLE,
+            # SELECT TOP <n> is HANA grammar, but TOP is only tokenized where a dialect opts
+            # in. Without this the whole statement is a parse error, not a degraded parse.
+            # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/select-statement-data-manipulation
+            "TOP": TokenType.TOP,
+            # HANA spells the regex predicate LIKE_REGEXPR. Reusing RLIKE's token routes it
+            # through the existing RANGE_PARSERS entry, so it lands on exp.RegexpLike and
+            # reaches the other dialects' regex operators instead of failing to parse.
+            # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/like-regexpr-predicate
+            "LIKE_REGEXPR": TokenType.RLIKE,
         }
 
     Parser = HanaParser

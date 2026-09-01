@@ -89,6 +89,14 @@ def _extract_sql(self: HanaGenerator, expression: exp.Extract) -> str:
     if part == "QUARTER":
         return self.sql(_quarter_expr(expression.expression))
 
+    # ISO-8601 pins the ISODOW numbering (Monday 1 .. Sunday 7), so it maps onto the same
+    # WEEKDAY shift exp.DayOfWeekIso uses. Plain DOW is deliberately NOT mapped alongside it:
+    # its numbering is not standardized -- Postgres counts Sunday as 0 while exp.DayOfWeek
+    # counts it as 1 -- so picking one would be a guess, and an off-by-one here is invisible
+    # in a result set.
+    if part == "ISODOW":
+        return _day_of_week_iso_sql(self, exp.DayOfWeekIso(this=expression.expression))
+
     self.unsupported(f"EXTRACT part '{part}' is not supported in SAP HANA.")
     return generator.Generator.extract_sql(self, expression)
 
@@ -192,6 +200,20 @@ def _sha2_sql(self: HanaGenerator, expression: exp.SHA2) -> str:
     return _hash_sql(self, "HASH_SHA256", expression.this)
 
 
+def _regexp_like_sql(self: HanaGenerator, expression: exp.RegexpLike) -> str:
+    """Render the regex match as HANA's LIKE_REGEXPR infix predicate, not a function call.
+
+    The optional FLAG modifier is carried through so a HANA -> HANA round trip keeps it; the
+    dialects that spell the flags differently drop it, as they already do for every other
+    dialect's regex flags.
+    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/like-regexpr-predicate
+    """
+    sql = self.binary(expression, "LIKE_REGEXPR")
+    flag = expression.args.get("flag")
+
+    return f"{sql} FLAG {self.sql(flag)}" if flag else sql
+
+
 def _strposition_sql(self: HanaGenerator, expression: exp.StrPosition) -> str:
     """Render exp.StrPosition as HANA's LOCATE.
 
@@ -290,14 +312,21 @@ def _date_diff_sql(self: HanaGenerator, expression: DateDelta) -> str:
 
     seconds = SECONDS_PER_UNIT.get(unit)
     if seconds:
-        # No HOURS_BETWEEN / MINUTES_BETWEEN in HANA. Divide SECONDS_BETWEEN and cast, because
-        # HANA's `/` is true division and would otherwise return a fraction where a diff is an
-        # integer. This measures elapsed whole units rather than counting boundary crossings the
-        # way T-SQL's DATEDIFF does.
+        # No HOURS_BETWEEN / MINUTES_BETWEEN in HANA, so divide SECONDS_BETWEEN -- but HANA's
+        # `/` is true division, so the quotient has to be truncated explicitly.
+        #
+        # ROUND(<x>, 0, ROUND_DOWN) rather than a bare CAST: converting a fractional value to an
+        # integer type ROUNDS in HANA, which would report a whole extra unit past the half-way
+        # mark (1h31m as 2 hours). ROUND_DOWN truncates toward zero, which is what a difference
+        # in whole units means -- and unlike FLOOR it is also right when the difference is
+        # negative, where flooring -1.5 would give -2 rather than -1.
+        # This measures elapsed whole units rather than counting boundary crossings the way
+        # T-SQL's DATEDIFF does.
         divided = exp.Div(
             this=exp.func("SECONDS_BETWEEN", start, end), expression=exp.Literal.number(seconds)
         )
-        return self.sql(exp.cast(divided, exp.DType.BIGINT))
+        truncated = exp.func("ROUND", divided, exp.Literal.number(0), exp.var("ROUND_DOWN"))
+        return self.sql(exp.cast(truncated, exp.DType.BIGINT))
 
     if unit not in DATE_UNITS:
         self.unsupported(f"{unit}S_BETWEEN does not exist in SAP HANA.")
@@ -326,6 +355,10 @@ class HanaGenerator(generator.Generator):
     # ... but it does support locking reads, which the base default would silently discard.
     LOCKING_READS_SUPPORTED = True
 
+    # HANA's array length function is CARDINALITY, not the base default ARRAY_LENGTH.
+    # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/cardinality-function-array
+    ARRAY_SIZE_NAME = "CARDINALITY"
+
     # HANA's set operators take no ALL/DISTINCT qualifier, and it has neither TO_NUMBER nor NVL2.
     EXCEPT_INTERSECT_SUPPORT_ALL_CLAUSE = False
     SUPPORTS_TO_NUMBER = False
@@ -339,6 +372,12 @@ class HanaGenerator(generator.Generator):
         exp.DType.BINARY: "VARBINARY",
         exp.DType.BLOB: "BLOB",
         exp.DType.DATETIME: "TIMESTAMP",
+        # HANA's bare FLOAT is 64-bit, so it means DOUBLE, not FLOAT -- its 32-bit type is
+        # spelled REAL. Every dialect parses REAL to DType.FLOAT, so rendering that back as
+        # FLOAT here would silently widen a 32-bit column to 64-bit. Postgres and DuckDB, the
+        # other two dialects whose bare FLOAT is double-width, map it the same way.
+        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/numeric-data-types
+        exp.DType.FLOAT: "REAL",
         # HANA's TEXT is a full-text search type, not a character type; NCLOB is the
         # unbounded string type. https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/data-types
         exp.DType.TEXT: "NCLOB",
@@ -371,6 +410,9 @@ class HanaGenerator(generator.Generator):
         exp.DayOfWeek: _day_of_week_sql,
         exp.DayOfWeekIso: _day_of_week_iso_sql,
         exp.DayOfYear: rename_func("DAYOFYEAR"),
+        # HANA's code-point-to-character function is CHAR; it has no CHR, which is what the
+        # base generator emits.
+        exp.Chr: rename_func("CHAR"),
         exp.Extract: _extract_sql,
         # HANA's string aggregate is STRING_AGG; it has no GROUP_CONCAT.
         exp.GroupConcat: _group_concat_sql,
@@ -380,6 +422,7 @@ class HanaGenerator(generator.Generator):
         # HANA's arithmetic operators are only unary -, +, -, *, / -- modulo is a function.
         exp.Mod: rename_func("MOD"),
         exp.Quarter: _quarter_sql,
+        exp.RegexpLike: _regexp_like_sql,
         exp.Repeat: _repeat_sql,
         exp.SHA2: _sha2_sql,
         exp.StrPosition: _strposition_sql,
@@ -423,6 +466,13 @@ class HanaGenerator(generator.Generator):
         """
         if expression.is_type(exp.DType.BINARY, exp.DType.VARBINARY) and not expression.expressions:
             return "BLOB"
+
+        # HANA's FLOAT(<n>) is a *parameterized* float, 32- or 64-bit depending on n, and the
+        # tokenizer reads a bare FLOAT as DOUBLE (see the Tokenizer). A DOUBLE that kept a
+        # parameter can only have come from FLOAT(<n>), and DOUBLE takes no parameter in HANA,
+        # so it has to go back out under its original spelling.
+        if expression.is_type(exp.DType.DOUBLE) and expression.expressions:
+            return f"FLOAT({self.expressions(expression, flat=True)})"
 
         return super().datatype_sql(expression)
 
