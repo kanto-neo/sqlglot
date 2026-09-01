@@ -1,6 +1,6 @@
 from sqlglot import UnsupportedError, exp, parse_one
-from sqlglot.errors import ErrorLevel
 from sqlglot.dialects.hana import _TIME_ELEMENTS
+from sqlglot.errors import ErrorLevel
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from tests.dialects.test_dialect import Validator
 
@@ -563,3 +563,104 @@ class TestHana(Validator):
                     "TIMESTAMPADD",
                 ):
                     self.assertNotIn(banned, out, f"{sql} leaked {banned}: {out}")
+
+    def test_char_is_not_chr(self):
+        # HANA's code-point-to-character function is CHAR; the base generator's CHR does not
+        # exist there, so an unmapped exp.Chr would emit an unknown function.
+        self.validate_identity("SELECT CHAR(65)")
+        self.validate_all(
+            "SELECT CHAR(65)",
+            read={"postgres": "SELECT CHR(65)"},
+            write={"postgres": "SELECT CHR(65)", "tsql": "SELECT CHAR(65)"},
+        )
+
+    def test_top(self):
+        # SELECT TOP <n> is HANA grammar. Without the tokenizer entry the whole statement is a
+        # parse error rather than a query with a limit.
+        self.validate_identity("SELECT TOP 5 a FROM t", "SELECT a FROM t LIMIT 5")
+        self.validate_identity("SELECT TOP 5 DISTINCT a FROM t", "SELECT DISTINCT a FROM t LIMIT 5")
+        self.validate_all(
+            "SELECT a FROM t LIMIT 5",
+            read={"tsql": "SELECT TOP 5 a FROM t"},
+        )
+        # Opting into the TOP token costs the bare identifier, exactly as it does in the other
+        # dialects that support TOP (tsql, teradata). Quoting is the escape hatch.
+        self.validate_identity('SELECT "top" FROM t')
+
+    def test_array_size_is_cardinality(self):
+        self.validate_identity("SELECT CARDINALITY(a) FROM t")
+        self.validate_all(
+            "SELECT CARDINALITY(a) FROM t",
+            read={"bigquery": "SELECT ARRAY_LENGTH(a) FROM t"},
+            write={"presto": "SELECT CARDINALITY(a) FROM t"},
+        )
+
+    def test_like_regexpr(self):
+        # HANA spells the regex predicate as an infix operator, with an optional FLAG.
+        self.validate_identity("SELECT * FROM t WHERE a LIKE_REGEXPR 'x'")
+        self.validate_identity("SELECT * FROM t WHERE NOT a LIKE_REGEXPR 'x'")
+        self.validate_identity("SELECT * FROM t WHERE a LIKE_REGEXPR 'x' FLAG 'i'")
+        self.validate_all(
+            "SELECT * FROM t WHERE a LIKE_REGEXPR 'x'",
+            read={"postgres": "SELECT * FROM t WHERE a ~ 'x'"},
+            write={
+                "postgres": "SELECT * FROM t WHERE a ~ 'x'",
+                "oracle": "SELECT * FROM t WHERE REGEXP_LIKE(a, 'x')",
+                "duckdb": "SELECT * FROM t WHERE REGEXP_MATCHES(a, 'x')",
+            },
+        )
+
+    def test_real_keeps_its_width(self):
+        # HANA's bare FLOAT is 64-bit -- i.e. DOUBLE -- while REAL is the 32-bit type. Rendering
+        # DType.FLOAT (which every dialect parses REAL into) as FLOAT would silently widen it.
+        self.validate_identity("SELECT CAST(a AS REAL) FROM t")
+        self.validate_identity("SELECT CAST(a AS DOUBLE) FROM t")
+        self.validate_identity("SELECT CAST(a AS FLOAT) FROM t", "SELECT CAST(a AS DOUBLE) FROM t")
+        # FLOAT(<n>) is parameterized and must keep its own spelling; DOUBLE takes no parameter.
+        self.validate_identity("CREATE TABLE t (a FLOAT(10), b REAL, c DOUBLE)")
+        self.validate_all(
+            "CREATE TABLE t (a REAL, b DOUBLE)",
+            read={"postgres": "CREATE TABLE t (a REAL, b DOUBLE PRECISION)"},
+            write={"postgres": "CREATE TABLE t (a REAL, b DOUBLE PRECISION)"},
+        )
+
+    def test_whole_unit_diff_truncates_toward_zero(self):
+        # Converting a fractional value to an integer type ROUNDS in HANA, so a bare CAST would
+        # report a whole extra unit past the half-way mark. ROUND_DOWN truncates toward zero.
+        for read, sql in (
+            ("snowflake", "SELECT DATEDIFF(hour, a, b)"),
+            ("snowflake", "SELECT DATEDIFF(minute, a, b)"),
+        ):
+            with self.subTest(sql=sql):
+                out = parse_one(sql, read=read).sql("hana")
+                self.assertIn("ROUND_DOWN", out)
+                self.assertIn("SECONDS_BETWEEN(a, b)", out)
+
+        self.validate_all(
+            "SELECT CAST(ROUND(SECONDS_BETWEEN(a, b) / 3600, 0, ROUND_DOWN) AS BIGINT)",
+            read={"snowflake": "SELECT DATEDIFF(hour, a, b)"},
+        )
+
+    def test_next_day_and_map_are_hana_shaped(self):
+        # HANA's NEXT_DAY takes one argument and means "the day after"; exp.NextDay models
+        # Oracle's two-argument form and would reject it.
+        self.validate_identity("SELECT NEXT_DAY(a) FROM t", "SELECT ADD_DAYS(a, 1) FROM t")
+        self.validate_all(
+            "SELECT ADD_DAYS(a, 1) FROM t",
+            read={"hana": "SELECT NEXT_DAY(a) FROM t"},
+            write={"postgres": "SELECT a + INTERVAL '1 DAY' FROM t"},
+        )
+        # MAP is a variadic CASE-like selector in HANA; exp.Map caps at two arguments.
+        self.validate_identity("SELECT MAP(a, 1, 'one', 2, 'two', 'other') FROM t")
+
+    def test_isodow_is_mapped_but_dow_is_not(self):
+        # ISO-8601 pins ISODOW at Monday 1 .. Sunday 7, so it maps onto WEEKDAY + 1. Plain DOW
+        # has no standardized numbering, so it is deliberately refused rather than guessed at.
+        self.validate_all(
+            "SELECT (WEEKDAY(a) + 1) FROM t",
+            read={"postgres": "SELECT EXTRACT(ISODOW FROM a) FROM t"},
+        )
+        with self.assertRaises(UnsupportedError):
+            parse_one("SELECT EXTRACT(DOW FROM a) FROM t", read="postgres").sql(
+                "hana", unsupported_level=ErrorLevel.RAISE
+            )
