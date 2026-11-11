@@ -7,9 +7,11 @@ from sqlglot.dialects.dialect import (
     concat_to_dpipe_sql,
     concat_ws_to_dpipe_sql,
     groupconcat_sql,
+    map_date_part,
     no_ilike_sql,
     no_trycast_sql,
     rename_func,
+    unit_to_var,
 )
 from sqlglot.parsers.hana import DATE_UNITS
 
@@ -36,9 +38,15 @@ EXTRACT_FUNCTION_BY_PART = {
     "DOY": "DAYOFYEAR",
 }
 
-# HANA has no ADD_HOURS / ADD_MINUTES / HOURS_BETWEEN / MINUTES_BETWEEN, so those units are
-# expressed in seconds instead. Same rewrite Hibernate's HANADialect uses.
-SECONDS_PER_UNIT = {"HOUR": 3600, "MINUTE": 60}
+# HANA has no ADD_HOURS / ADD_MINUTES / ADD_WEEKS / ADD_QUARTERS (nor the matching _BETWEEN
+# functions), so those units are expressed as a multiple of one HANA does have. Hibernate's
+# HANADialect uses the same rewrite for hours and minutes.
+SCALED_UNITS = {
+    "HOUR": ("SECOND", 3600),
+    "MINUTE": ("SECOND", 60),
+    "WEEK": ("DAY", 7),
+    "QUARTER": ("MONTH", 3),
+}
 
 # DATE_TRUNC units that SERIES_ROUND can express as a single interval.
 TRUNC_INTERVAL_BY_UNIT = {
@@ -50,6 +58,16 @@ TRUNC_INTERVAL_BY_UNIT = {
     "MINUTE": "INTERVAL 1 MINUTE",
     "SECOND": "INTERVAL 1 SECOND",
 }
+
+# SAP HANA has no DAYOFWEEK; WEEKDAY is Monday(0)..Sunday(6). exp.DayOfWeek uses MySQL's
+# Sunday(1)..Saturday(7), so the value has to be rotated, and ISO-8601 is Monday(1)..Sunday(7).
+# https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/weekday-function-datetime
+DAY_OF_WEEK_TEMPLATE: exp.Expr = exp.maybe_parse("(MOD(WEEKDAY(:this) + 1, 7) + 1)")
+DAY_OF_WEEK_ISO_TEMPLATE: exp.Expr = exp.maybe_parse("(WEEKDAY(:this) + 1)")
+
+# HANA's QUARTER() returns the string 'YYYY-Qn', so an integer quarter is computed. FLOOR is
+# needed because HANA's `/` is true division.
+QUARTER_TEMPLATE: exp.Expr = exp.maybe_parse("(FLOOR((MONTH(:this) - 1) / 3) + 1)")
 
 # The interval-adding and interval-subtracting expressions this dialect routes through one
 # pair of helpers. All are exp.Func subclasses carrying `this`, `expression` and `unit`.
@@ -71,118 +89,6 @@ DateDelta = t.Union[
 ]
 
 
-def _day_of_week_sql(self: HanaGenerator, expression: exp.DayOfWeek) -> str:
-    """SAP HANA has no DAYOFWEEK. WEEKDAY is Monday(0)..Sunday(6).
-
-    exp.DayOfWeek carries sqlglot's MySQL-style Sunday(1)..Saturday(7) convention, so the value
-    has to be rotated, not just renamed -- emitting WEEKDAY alone would be off by a day and
-    silently wrong.
-    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/weekday-function-datetime
-    """
-    return f"(MOD({self.func('WEEKDAY', expression.this)} + 1, 7) + 1)"
-
-
-def _day_of_week_iso_sql(self: HanaGenerator, expression: exp.DayOfWeekIso) -> str:
-    # WEEKDAY is 0-based from Monday; ISO-8601 is 1-based from Monday.
-    return f"({self.func('WEEKDAY', expression.this)} + 1)"
-
-
-def _extract_sql(self: HanaGenerator, expression: exp.Extract) -> str:
-    part = expression.name.upper()
-
-    if part in EXTRACT_NATIVE_PARTS:
-        return generator.Generator.extract_sql(self, expression)
-
-    func_name = EXTRACT_FUNCTION_BY_PART.get(part)
-    if func_name:
-        return self.func(func_name, expression.expression)
-
-    if part == "QUARTER":
-        return self.sql(_quarter_expr(expression.expression))
-
-    # ISO-8601 pins the ISODOW numbering (Monday 1 .. Sunday 7), so it maps onto the same
-    # WEEKDAY shift exp.DayOfWeekIso uses. Plain DOW is deliberately NOT mapped alongside it:
-    # its numbering is not standardized -- Postgres counts Sunday as 0 while exp.DayOfWeek
-    # counts it as 1 -- so picking one would be a guess, and an off-by-one here is invisible
-    # in a result set.
-    if part == "ISODOW":
-        return _day_of_week_iso_sql(self, exp.DayOfWeekIso(this=expression.expression))
-
-    self.unsupported(f"EXTRACT part '{part}' is not supported in SAP HANA.")
-    return generator.Generator.extract_sql(self, expression)
-
-
-def _quarter_expr(this: exp.Expr) -> exp.Expr:
-    """Compute an INTEGER quarter, since HANA's QUARTER() returns the string 'YYYY-Qn'.
-
-    FLOOR is required, not cosmetic: HANA's `/` is true division, so (MONTH - 1) / 3 yields a
-    fraction for two months in every quarter and the result would not be an integer at all.
-    """
-    month = exp.func("MONTH", this.copy())
-    divided = exp.Div(
-        this=exp.paren(month - exp.Literal.number(1)), expression=exp.Literal.number(3)
-    )
-    return exp.paren(exp.func("FLOOR", divided) + exp.Literal.number(1))
-
-
-def _quarter_sql(self: HanaGenerator, expression: exp.Quarter) -> str:
-    return self.sql(_quarter_expr(expression.this))
-
-
-def _trim_sql(self: HanaGenerator, expression: exp.Trim) -> str:
-    """Render exp.Trim with SAP HANA's set semantics.
-
-    HANA's LTRIM/RTRIM take a <remove_set>, "treated as a set of characters and not as a search
-    string" -- LTRIM('babababAabend', 'ab') is 'Aabend'. That matches what exp.Trim means, so the
-    base rendering is correct for LEADING and TRAILING and must NOT be replaced by the shared ANSI
-    trim_sql helper, which would emit substring semantics and quietly change the result.
-    Only BOTH needs handling: HANA has no two-argument TRIM(<str>, <set>).
-    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/ltrim-function-string
-    """
-    remove_set = expression.expression
-    position = self.sql(expression, "position")
-
-    # BOTH is the default, and may be either implicit or spelled out; both reach here.
-    if remove_set and position in ("", "BOTH"):
-        return self.func("LTRIM", self.func("RTRIM", expression.this, remove_set), remove_set)
-
-    return generator.Generator.trim_sql(self, expression)
-
-
-def _group_concat_sql(self: HanaGenerator, expression: exp.GroupConcat) -> str:
-    """Render exp.GroupConcat as STRING_AGG.
-
-    `sep=None` rather than the helper's ',' default: HANA's STRING_AGG documents no default
-    delimiter, so synthesising one would change the value of a HANA query that omitted it.
-    DISTINCT has no place in HANA's STRING_AGG grammar, so it is refused rather than emitted.
-    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/string-agg-function-aggregate
-    """
-    if isinstance(expression.this, exp.Distinct):
-        self.unsupported("SAP HANA's STRING_AGG does not support DISTINCT.")
-
-    return groupconcat_sql(self, expression, func_name="STRING_AGG", sep=None, within_group=False)
-
-
-def _repeat_sql(self: HanaGenerator, expression: exp.Repeat) -> str:
-    """SAP HANA has no REPEAT function; RPAD padded with the string itself is the idiom.
-
-    Emulated as RPAD(<str>, <times> * LENGTH(<str>), <str>), the same rewrite Hibernate's
-    HANADialect uses. Note this pads to a computed length rather than concatenating, so it
-    relies on <times> being non-negative -- as REPEAT itself does.
-    """
-    this = expression.this
-    times = expression.args.get("times")
-
-    if not times:
-        self.unsupported("REPEAT requires a repetition count in SAP HANA.")
-        return self.function_fallback_sql(expression)
-
-    # `*` rather than exp.Mul(...) so a compound <times> is parenthesized by _binop; a bare
-    # exp.Mul would emit `a + b * LENGTH(x)` and compute the wrong length.
-    length = times * exp.func("LENGTH", this.copy())
-    return self.func("RPAD", this, length, this.copy())
-
-
 def _hash_sql(self: HanaGenerator, func_name: str, this: exp.Expr) -> str:
     """Render a hash as a hex STRING, which is what exp.MD5 / exp.SHA2 denote.
 
@@ -198,58 +104,6 @@ def _hash_sql(self: HanaGenerator, func_name: str, this: exp.Expr) -> str:
     )
 
 
-def _md5_sql(self: HanaGenerator, expression: exp.MD5) -> str:
-    return _hash_sql(self, "HASH_MD5", expression.this)
-
-
-def _sha2_sql(self: HanaGenerator, expression: exp.SHA2) -> str:
-    length = expression.text("length") or "256"
-
-    # HASH_MD5 and HASH_SHA256 are the only hash functions SAP HANA documents; there is no
-    # HASH_SHA1, HASH_SHA384 or HASH_SHA512.
-    if length != "256":
-        self.unsupported(f"SHA2 with length {length} is not supported in SAP HANA.")
-        return self.function_fallback_sql(expression)
-
-    return _hash_sql(self, "HASH_SHA256", expression.this)
-
-
-def _regexp_like_sql(self: HanaGenerator, expression: exp.RegexpLike) -> str:
-    """Render the regex match as HANA's LIKE_REGEXPR infix predicate, not a function call.
-
-    The optional FLAG modifier is carried through so a HANA -> HANA round trip keeps it; the
-    dialects that spell the flags differently drop it, as they already do for every other
-    dialect's regex flags.
-    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/like-regexpr-predicate
-    """
-    sql = self.binary(expression, "LIKE_REGEXPR")
-    flag = expression.args.get("flag")
-
-    return f"{sql} FLAG {self.sql(flag)}" if flag else sql
-
-
-def _strposition_sql(self: HanaGenerator, expression: exp.StrPosition) -> str:
-    """Render exp.StrPosition as HANA's LOCATE.
-
-    LOCATE(<haystack>, <needle>[, <start_position>[, <occurrences>]]) takes the haystack first,
-    the reverse of the MySQL/T-SQL LOCATE that the shared strposition_sql helper assumes -- which
-    is why this cannot reuse it. Both optional arguments are supported natively.
-    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/locate-function-string
-    """
-    args: list[exp.Expr] = [expression.this, expression.args["substr"]]
-
-    position = expression.args.get("position")
-    occurrence = expression.args.get("occurrence")
-
-    if position or occurrence:
-        # <occurrences> is the fourth argument, so a bare occurrence still needs a start.
-        args.append(position or exp.Literal.number(1))
-    if occurrence:
-        args.append(occurrence)
-
-    return self.func("LOCATE", *args)
-
-
 def _to_varchar_sql(self: HanaGenerator, expression: exp.ToChar | exp.TimeToStr) -> str:
     # TO_VARCHAR doubles as the datetime formatter; a NULL format model means a plain conversion.
     # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/to-varchar-function-data-type-conversion
@@ -257,30 +111,38 @@ def _to_varchar_sql(self: HanaGenerator, expression: exp.ToChar | exp.TimeToStr)
     return self.func("TO_VARCHAR", expression.this, self.format_time(expression) if fmt else None)
 
 
-def _scale_to_seconds(offset: exp.Expr, seconds: int) -> exp.Expr:
-    """Scale an hour/minute offset into seconds for the ADD_SECONDS / SECONDS_BETWEEN rewrites.
+def _unit_name(expression: exp.Expr) -> str:
+    # BigQuery's WEEK(<day>) arrives as exp.WeekStart; plural/abbreviated units are normalized.
+    unit = unit_to_var(expression)
+    if isinstance(unit, exp.WeekStart):
+        return "WEEK"
+
+    return map_date_part(unit).name.upper() if unit else "DAY"
+
+
+def _scale(offset: exp.Expr, factor: int) -> exp.Expr:
+    """Scale an offset for the SCALED_UNITS rewrites.
 
     A numeric literal is folded so the output reads `ADD_SECONDS(d, 10800)` rather than
     `3 * 3600`; this also covers the dialects that hand the offset over as a *string* literal,
-    where `'3' * 3600` would otherwise be emitted. Anything else goes through the `*` operator
-    overload, which parenthesizes a compound operand (a bare exp.Mul would not).
+    where `'3' * 3600` would otherwise be emitted.
     """
     if isinstance(offset, exp.Literal):
         try:
-            return exp.Literal.number(int(offset.name) * seconds)
+            return exp.Literal.number(int(offset.name) * factor)
         except ValueError:
             pass
 
-    return offset * exp.Literal.number(seconds)
+    return offset * exp.Literal.number(factor)
 
 
 def _date_add_sql(self: HanaGenerator, expression: DateDelta) -> str:
-    unit = expression.text("unit").upper() or "DAY"
+    unit = _unit_name(expression)
     offset = expression.expression
 
-    seconds = SECONDS_PER_UNIT.get(unit)
-    if seconds:
-        return self.func("ADD_SECONDS", expression.this, _scale_to_seconds(offset, seconds))
+    if unit in SCALED_UNITS:
+        unit, factor = SCALED_UNITS[unit]
+        offset = _scale(offset, factor)
 
     if unit not in DATE_UNITS:
         self.unsupported(f"ADD_{unit}S does not exist in SAP HANA.")
@@ -323,32 +185,24 @@ def _interval_to_date_add(this: exp.Expr, interval: exp.Interval) -> exp.DateAdd
     if amount.is_string and amount.name.lstrip("-").isdigit():
         amount = exp.Literal.number(amount.name)
 
-    # Postgres-style INTERVAL '2 hours' keeps the plural unit.
-    unit = interval.text("unit").upper()
-    if unit.endswith("S") and (unit[:-1] in DATE_UNITS or unit[:-1] in SECONDS_PER_UNIT):
-        unit = unit[:-1]
-
-    return exp.DateAdd(this=this, expression=amount, unit=exp.var(unit))
+    return exp.DateAdd(this=this, expression=amount, unit=interval.unit)
 
 
 def _date_diff_sql(self: HanaGenerator, expression: DateDelta) -> str:
-    unit = expression.text("unit").upper() or "DAY"
+    unit = _unit_name(expression)
 
     # <unit>S_BETWEEN(<start>, <end>) counts forward from the first argument, which is the
     # opposite of the (end, start) order exp.DateDiff stores.
     start, end = expression.expression, expression.this
 
-    seconds = SECONDS_PER_UNIT.get(unit)
-    if seconds:
-        # No HOURS_BETWEEN / MINUTES_BETWEEN in HANA, so divide SECONDS_BETWEEN. HANA's `/` is
-        # true division, and casting the quotient to an integer type truncates toward zero, which
-        # is what a difference in whole units means (1h31m is 1 hour, -1h31m is -1). This
-        # measures elapsed whole units rather than counting boundary crossings the way T-SQL's
-        # DATEDIFF does.
-        divided = exp.Div(
-            this=exp.func("SECONDS_BETWEEN", start, end), expression=exp.Literal.number(seconds)
-        )
-        return self.sql(exp.cast(divided, exp.DType.BIGINT))
+    if unit in SCALED_UNITS:
+        # HANA's `/` is true division, and casting the quotient to an integer type truncates
+        # toward zero, which is what a difference in whole units means (1h31m is 1 hour, -1h31m
+        # is -1). This measures elapsed whole units rather than counting boundary crossings the
+        # way T-SQL's DATEDIFF does.
+        base_unit, factor = SCALED_UNITS[unit]
+        between = exp.func(f"{base_unit}S_BETWEEN", start, end)
+        return self.sql(exp.cast(between / exp.Literal.number(factor), exp.DType.BIGINT))
 
     if unit not in DATE_UNITS:
         self.unsupported(f"{unit}S_BETWEEN does not exist in SAP HANA.")
@@ -364,11 +218,11 @@ def _date_trunc_sql(self: HanaGenerator, expression: exp.DateTrunc | exp.Timesta
     interval does not start on a Monday.
     https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/series-round-function-series-data
     """
-    unit = expression.text("unit").upper()
+    unit = _unit_name(expression)
     interval = TRUNC_INTERVAL_BY_UNIT.get(unit)
 
     if not interval:
-        self.unsupported(f"Truncating to {unit or 'an unknown unit'} is not supported in SAP HANA.")
+        self.unsupported(f"Truncating to {unit} is not supported in SAP HANA.")
         return self.function_fallback_sql(expression)
 
     return self.func(
@@ -447,9 +301,6 @@ class HanaGenerator(generator.Generator):
         **generator.Generator.TRANSFORMS,
         exp.Concat: concat_to_dpipe_sql,
         exp.ConcatWs: concat_ws_to_dpipe_sql,
-        exp.CurrentDate: lambda *_: "CURRENT_DATE",
-        exp.CurrentTime: lambda *_: "CURRENT_TIME",
-        exp.CurrentTimestamp: lambda *_: "CURRENT_TIMESTAMP",
         exp.DateAdd: _date_add_sql,
         exp.DateDiff: _date_diff_sql,
         exp.DatetimeDiff: _date_diff_sql,
@@ -460,25 +311,14 @@ class HanaGenerator(generator.Generator):
         # SAP HANA spells these without separators, unlike sqlglot's default rendering.
         # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/dayofmonth-function-datetime
         exp.DayOfMonth: rename_func("DAYOFMONTH"),
-        exp.DayOfWeek: _day_of_week_sql,
-        exp.DayOfWeekIso: _day_of_week_iso_sql,
         exp.DayOfYear: rename_func("DAYOFYEAR"),
         # HANA's code-point-to-character function is CHAR; it has no CHR, which is what the
         # base generator emits.
         exp.Chr: rename_func("CHAR"),
-        exp.Extract: _extract_sql,
-        # HANA's string aggregate is STRING_AGG; it has no GROUP_CONCAT.
-        exp.GroupConcat: _group_concat_sql,
         # HANA has no ILIKE; the case-insensitive comparison has to be spelled out.
         exp.ILike: no_ilike_sql,
-        exp.MD5: _md5_sql,
         # HANA's arithmetic operators are only unary -, +, -, *, / -- modulo is a function.
         exp.Mod: rename_func("MOD"),
-        exp.Quarter: _quarter_sql,
-        exp.RegexpLike: _regexp_like_sql,
-        exp.Repeat: _repeat_sql,
-        exp.SHA2: _sha2_sql,
-        exp.StrPosition: _strposition_sql,
         exp.StrToDate: lambda self, e: self.func("TO_DATE", e.this, self.format_time(e)),
         exp.StrToTime: lambda self, e: self.func("TO_TIMESTAMP", e.this, self.format_time(e)),
         exp.TimeStrToTime: rename_func("TO_TIMESTAMP"),
@@ -491,7 +331,6 @@ class HanaGenerator(generator.Generator):
         exp.TimestampSub: _date_sub_sql,
         exp.TimestampTrunc: _date_trunc_sql,
         exp.ToChar: _to_varchar_sql,
-        exp.Trim: _trim_sql,
         exp.TsOrDsAdd: _date_add_sql,
         exp.TsOrDsDiff: _date_diff_sql,
         # HANA has no TRY_CAST; TRY_SUPPORTED only gates exp.Try, not exp.TryCast.
@@ -509,6 +348,135 @@ class HanaGenerator(generator.Generator):
             ]
         ),
     }
+
+    def currentdate_sql(self, expression: exp.CurrentDate) -> str:
+        return self._current_sql(expression, "DATE")
+
+    def currenttime_sql(self, expression: exp.CurrentTime) -> str:
+        return self._current_sql(expression, "TIME")
+
+    def currenttimestamp_sql(self, expression: exp.CurrentTimestamp) -> str:
+        return self._current_sql(expression, "TIMESTAMP")
+
+    def _current_sql(self, expression: exp.Expr, kind: str) -> str:
+        # HANA's CURRENT_<kind> takes no time zone, but has CURRENT_UTC<kind> for UTC.
+        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/current-utctimestamp-function-datetime
+        zone = expression.this
+        if zone and zone.name.upper() == "UTC":
+            return f"CURRENT_UTC{kind}"
+        if zone:
+            self.unsupported(f"CURRENT_{kind} with a time zone is not supported in SAP HANA.")
+        return f"CURRENT_{kind}"
+
+    def dayofweek_sql(self, expression: exp.DayOfWeek) -> str:
+        return self.sql(exp.replace_placeholders(DAY_OF_WEEK_TEMPLATE.copy(), this=expression.this))
+
+    def dayofweekiso_sql(self, expression: exp.DayOfWeekIso) -> str:
+        return self.sql(
+            exp.replace_placeholders(DAY_OF_WEEK_ISO_TEMPLATE.copy(), this=expression.this)
+        )
+
+    def quarter_sql(self, expression: exp.Quarter) -> str:
+        return self.sql(exp.replace_placeholders(QUARTER_TEMPLATE.copy(), this=expression.this))
+
+    def extract_sql(self, expression: exp.Extract) -> str:
+        part = expression.name.upper()
+        this = expression.expression
+
+        if part in EXTRACT_NATIVE_PARTS:
+            return super().extract_sql(expression)
+
+        func_name = EXTRACT_FUNCTION_BY_PART.get(part)
+        if func_name:
+            return self.func(func_name, this)
+
+        if part == "QUARTER":
+            return self.quarter_sql(exp.Quarter(this=this))
+
+        # ISO-8601 pins ISODOW (Monday 1 .. Sunday 7). Plain DOW is deliberately not mapped:
+        # Postgres counts Sunday as 0 while exp.DayOfWeek counts it as 1.
+        if part == "ISODOW":
+            return self.dayofweekiso_sql(exp.DayOfWeekIso(this=this))
+
+        self.unsupported(f"EXTRACT part '{part}' is not supported in SAP HANA.")
+        return super().extract_sql(expression)
+
+    def trim_sql(self, expression: exp.Trim) -> str:
+        """Render exp.Trim with SAP HANA's set semantics.
+
+        HANA's LTRIM/RTRIM take a set of characters, not a search string, which matches what
+        exp.Trim means, so the base rendering is right for LEADING and TRAILING. Only BOTH needs
+        handling: HANA has no two-argument TRIM(<str>, <set>).
+        https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/ltrim-function-string
+        """
+        remove_set = expression.expression
+        position = self.sql(expression, "position")
+
+        if remove_set and position in ("", "BOTH"):
+            return self.func("LTRIM", self.func("RTRIM", expression.this, remove_set), remove_set)
+
+        return super().trim_sql(expression)
+
+    def groupconcat_sql(self, expression: exp.GroupConcat) -> str:
+        # HANA's STRING_AGG documents no default delimiter, so none is synthesized, and its
+        # grammar has no DISTINCT.
+        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/string-agg-function-aggregate
+        if isinstance(expression.this, exp.Distinct):
+            self.unsupported("SAP HANA's STRING_AGG does not support DISTINCT.")
+
+        return groupconcat_sql(
+            self, expression, func_name="STRING_AGG", sep=None, within_group=False
+        )
+
+    def repeat_sql(self, expression: exp.Repeat) -> str:
+        # HANA has no REPEAT; RPAD padded with the string itself is the idiom (Hibernate's
+        # HANADialect uses the same rewrite).
+        this = expression.this
+        times = expression.args.get("times")
+
+        if not times:
+            self.unsupported("REPEAT requires a repetition count in SAP HANA.")
+            return self.function_fallback_sql(expression)
+
+        return self.func("RPAD", this, times * exp.func("LENGTH", this.copy()), this.copy())
+
+    def md5_sql(self, expression: exp.MD5) -> str:
+        return _hash_sql(self, "HASH_MD5", expression.this)
+
+    def sha2_sql(self, expression: exp.SHA2) -> str:
+        length = expression.text("length") or "256"
+
+        # HASH_MD5 and HASH_SHA256 are the only hash functions SAP HANA documents.
+        if length != "256":
+            self.unsupported(f"SHA2 with length {length} is not supported in SAP HANA.")
+            return self.function_fallback_sql(expression)
+
+        return _hash_sql(self, "HASH_SHA256", expression.this)
+
+    def regexplike_sql(self, expression: exp.RegexpLike) -> str:
+        # HANA's regex match is the LIKE_REGEXPR infix predicate, with an optional FLAG.
+        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/like-regexpr-predicate
+        sql = self.binary(expression, "LIKE_REGEXPR")
+        flag = expression.args.get("flag")
+
+        return f"{sql} FLAG {self.sql(flag)}" if flag else sql
+
+    def strposition_sql(self, expression: exp.StrPosition) -> str:
+        # LOCATE(<haystack>, <needle>[, <start>[, <occurrences>]]) takes the haystack first, the
+        # reverse of the MySQL/T-SQL LOCATE the shared strposition_sql helper assumes.
+        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/locate-function-string
+        args: list[exp.Expr] = [expression.this, expression.args["substr"]]
+
+        position = expression.args.get("position")
+        occurrence = expression.args.get("occurrence")
+
+        if position or occurrence:
+            # <occurrences> is the fourth argument, so a bare occurrence still needs a start.
+            args.append(position or exp.Literal.number(1))
+        if occurrence:
+            args.append(occurrence)
+
+        return self.func("LOCATE", *args)
 
     def md5digest_sql(self, expression: exp.MD5Digest) -> str:
         # The binary digest is what HASH_MD5 returns natively; only the input needs converting.
@@ -566,7 +534,7 @@ class HanaGenerator(generator.Generator):
         # parameter can only have come from FLOAT(<n>), and DOUBLE takes no parameter in HANA,
         # so it has to go back out under its original spelling.
         if expression.is_type(exp.DType.DOUBLE) and expression.expressions:
-            return f"FLOAT({self.expressions(expression, flat=True)})"
+            return self.func("FLOAT", *expression.expressions)
 
         return super().datatype_sql(expression)
 
