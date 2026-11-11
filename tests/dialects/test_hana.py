@@ -427,3 +427,79 @@ class TestHana(Validator):
             read={"postgres": "SELECT * FROM (VALUES (1, 2), (3, 4)) AS t(a, b)"},
         )
         self.assert_unsupported("SELECT * FROM (SELECT * FROM x) AS t(a)", "postgres")
+
+    def test_booleans(self):
+        self.validate_identity(
+            "SELECT * FROM t WHERE a LIKE 'x!%' ESCAPE '!' AND b <> ALL (SELECT c FROM u)"
+        )
+        self.validate_identity(
+            "SELECT a LIKE 'x!%' ESCAPE '!' FROM t",
+            "SELECT CASE WHEN a LIKE 'x!%' ESCAPE '!' THEN TRUE WHEN NOT (a LIKE 'x!%' ESCAPE '!') THEN FALSE END FROM t",
+        )
+        self.validate_identity("SELECT CASE a WHEN 0 THEN 1 ELSE 2 END FROM t")
+        # Predicates are only allowed as conditions, and conditions must be predicates
+        self.validate_all(
+            "SELECT CASE WHEN a = b THEN TRUE WHEN NOT (a = b) THEN FALSE END FROM t WHERE flag = TRUE AND (x > 1 OR NOT active = TRUE)",
+            read={"postgres": "SELECT a = b FROM t WHERE flag AND (x > 1 OR NOT active)"},
+        )
+        self.validate_all(
+            "SELECT COUNT(CASE WHEN x > 1 THEN 1 END), SUM(CASE WHEN flag = TRUE THEN a ELSE NULL END) FROM t",
+            read={
+                "postgres": "SELECT COUNT(*) FILTER (WHERE x > 1), SUM(a) FILTER (WHERE flag) FROM t"
+            },
+        )
+        self.validate_all(
+            "SELECT * FROM t WHERE NOT ((a = b AND NOT a IS NULL AND NOT b IS NULL) OR (a IS NULL AND b IS NULL))",
+            read={"postgres": "SELECT * FROM t WHERE a IS DISTINCT FROM b"},
+        )
+
+    def test_semi_structured(self):
+        self.validate_all(
+            "SELECT JSON_QUERY(j, '$.a'), JSON_VALUE(j, '$.a[0].b') FROM t",
+            read={
+                "bigquery": "SELECT JSON_EXTRACT(j, '$.a'), JSON_EXTRACT_SCALAR(j, '$.a[0].b') FROM t"
+            },
+        )
+        self.validate_all(
+            "SELECT MEMBER_AT(arr, 1), MEMBER_AT(arr, 2) FROM t",
+            read={"bigquery": "SELECT arr[OFFSET(0)], arr[ORDINAL(2)] FROM t"},
+        )
+        self.validate_identity(
+            "SELECT SUBSTR_REGEXPR('a' FLAG 'i' IN s FROM 2 OCCURRENCE 3 GROUP 1) FROM t"
+        )
+        self.validate_all(
+            "SELECT SUBSTR_REGEXPR('a(b)' IN s GROUP 1) FROM t",
+            read={"bigquery": "SELECT REGEXP_EXTRACT(s, r'a(b)') FROM t"},
+        )
+        for sql, read in (
+            ("SELECT GENERATE_SERIES(1, 3)", "postgres"),
+            ("SELECT * FROM a NATURAL JOIN b", "postgres"),
+            ("SELECT ARG_MAX(a, b) FROM t", "duckdb"),
+            ("SELECT FIRST(a IGNORE NULLS) FROM t", "duckdb"),
+            ("SELECT ts AT TIME ZONE 'UTC' FROM t", "postgres"),
+        ):
+            self.assert_unsupported(sql, read)
+
+    def test_constructors(self):
+        self.validate_all(
+            "SELECT ADD_DAYS(ADD_MONTHS(TO_DATE(LPAD(TO_VARCHAR(y), 4, '0') || '-01-01'), m - 1), d - 1) FROM t",
+            read={"snowflake": "SELECT DATE_FROM_PARTS(y, m, d) FROM t"},
+        )
+        self.validate_all(
+            "SELECT ADD_SECONDS(TO_TIME('00:00:00'), (h * 3600) + (mi * 60) + s) FROM t",
+            read={"snowflake": "SELECT TIME_FROM_PARTS(h, mi, s) FROM t"},
+        )
+        self.validate_all(
+            "SELECT ADD_SECONDS(TO_TIMESTAMP('1970-01-01 00:00:00'), x), SECONDS_BETWEEN(TO_TIMESTAMP('1970-01-01 00:00:00'), ts) FROM t",
+            read={"duckdb": "SELECT TO_TIMESTAMP(x), EPOCH(ts) FROM t"},
+        )
+        self.validate_all(
+            "SELECT CAST(ts AS DATE), COUNT(DISTINCT x), CURRENT_TIMESTAMP, CAST(a AS TIMESTAMP), CAST(b AS TIME) FROM t",
+            read={
+                "postgres": "SELECT DATE(ts), COUNT(DISTINCT x), LOCALTIMESTAMP, CAST(a AS TIMESTAMPTZ), CAST(b AS TIMETZ) FROM t"
+            },
+        )
+        self.validate_all(
+            "SELECT HEXTOBIN(h), COUNT(DISTINCT x) FROM t",
+            read={"duckdb": "SELECT UNHEX(h), APPROX_COUNT_DISTINCT(x) FROM t"},
+        )
