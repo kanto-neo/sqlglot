@@ -6,6 +6,7 @@ from sqlglot.dialects.dialect import (
     concat_ws_to_dpipe_sql,
     groupconcat_sql,
     map_date_part,
+    no_filter_sql,
     no_ilike_sql,
     no_trycast_sql,
     rename_func,
@@ -47,6 +48,36 @@ DAY_OF_WEEK_ISO_TEMPLATE: exp.Expr = exp.maybe_parse("(WEEKDAY(:this) + 1)")
 # QUARTER and ISOWEEK return strings ('2024-Q2', '2024-W05')
 QUARTER_TEMPLATE: exp.Expr = exp.maybe_parse("(FLOOR((MONTH(:this) - 1) / 3) + 1)")
 WEEK_ISO_TEMPLATE: exp.Expr = exp.maybe_parse("CAST(SUBSTRING(ISOWEEK(:this), 7, 2) AS INT)")
+
+# Month and day overflow roll forward, as in Snowflake's DATE_FROM_PARTS
+DATE_FROM_PARTS_TEMPLATE: exp.Expr = exp.maybe_parse(
+    "ADD_DAYS(ADD_MONTHS(TO_DATE(LPAD(TO_VARCHAR(:year), 4, '0') || '-01-01'), :month - 1), :day - 1)"
+)
+EPOCH: exp.Expr = exp.maybe_parse("TO_TIMESTAMP('1970-01-01 00:00:00')")
+
+# Expressions HANA has no equivalent for, flagged instead of being emitted verbatim
+UNSUPPORTED_EXPRESSIONS: tuple[type[exp.Expr], ...] = (
+    exp.ApproxQuantile,
+    exp.ArgMax,
+    exp.ArgMin,
+    exp.ArrayExcept,
+    exp.ArrayInsert,
+    exp.ArraySlice,
+    exp.AtTimeZone,
+    exp.BitwiseAndAgg,
+    exp.BitwiseOrAgg,
+    exp.BitwiseXorAgg,
+    exp.CurrentVersion,
+    exp.Explode,
+    exp.Flatten,
+    exp.GenerateSeries,
+    exp.IgnoreNulls,
+    exp.Lateral,
+    exp.MakeInterval,
+    exp.NumberToStr,
+    exp.RespectNulls,
+    exp.ToVariant,
+)
 
 
 def _unit_name(expression: exp.Expr) -> str:
@@ -156,6 +187,85 @@ def _hash_sql(self: HanaGenerator, func_name: str, expression: exp.Func, hex: bo
     return self.func("LOWER", exp.func("BINTOHEX", digest)) if hex else self.sql(digest)
 
 
+def _unsupported_sql(self: HanaGenerator, expression: exp.Expr) -> str:
+    self.unsupported(f"{expression.key.upper()} is not supported in SAP HANA.")
+    base = getattr(generator.Generator, f"{expression.key}_sql", None)
+    if base:
+        return base(self, expression)
+    assert isinstance(expression, exp.Func)
+    return self.function_fallback_sql(expression)
+
+
+def _null_safe_eq(left: exp.Expr, right: exp.Expr) -> exp.Expr:
+    # Never NULL, unlike `left = right`
+    return exp.or_(
+        exp.and_(
+            left.copy().eq(right.copy()),
+            exp.not_(left.copy().is_(exp.null())),
+            exp.not_(right.copy().is_(exp.null())),
+        ),
+        exp.and_(left.copy().is_(exp.null()), right.copy().is_(exp.null())),
+    )
+
+
+def _is_escaped(node: exp.Expr) -> bool:
+    # `x LIKE y ESCAPE z` is one predicate, wrapped as a whole
+    return isinstance(node.parent, exp.Escape) and node.arg_key == "this"
+
+
+def _is_condition(node: exp.Expr) -> bool:
+    parent = node.parent
+    while parent and (isinstance(parent, exp.Paren) or _is_escaped(node)):
+        node, parent = parent, parent.parent
+
+    return (
+        isinstance(parent, (exp.Where, exp.Having, exp.Qualify, exp.Connector, exp.Not))
+        or (isinstance(parent, exp.CountIf) and node.arg_key == "this")
+        # In a simple CASE (`CASE x WHEN 0 THEN ...`) the WHEN holds a value, not a condition
+        or (
+            isinstance(parent, exp.If)
+            and node.arg_key == "this"
+            and not (isinstance(parent.parent, exp.Case) and parent.parent.this)
+        )
+        or (isinstance(parent, exp.Join) and node.arg_key == "on")
+    )
+
+
+def _fix_booleans(expression: exp.Expr) -> exp.Expr:
+    # HANA only accepts predicates as conditions, and only predicates: `SELECT a = b` and
+    # `WHERE flag` are both syntax errors
+    if not isinstance(expression, exp.Select):
+        return expression
+
+    predicates = (exp.Predicate, exp.Connector, exp.Not, exp.Escape)
+    nodes = list(expression.walk(prune=lambda n: n is not expression and isinstance(n, exp.Query)))
+
+    for node in reversed(nodes):
+        # ANY / ALL (subquery) are operands of a comparison, not predicates on their own
+        is_predicate = isinstance(node, predicates) and not isinstance(node, (exp.Any, exp.All))
+        if is_predicate and not _is_escaped(node) and not _is_condition(node):
+            node.replace(
+                exp.case()
+                .when(node.copy(), exp.true())
+                .when(exp.Not(this=exp.paren(node.copy())), exp.false())
+            )
+        elif not isinstance(node, (*predicates, exp.Paren)) and node.parent and _is_condition(node):
+            node.replace(node.copy().eq(exp.true()))
+
+    return expression
+
+
+def _json_extract_sql(
+    self: HanaGenerator, expression: exp.JSONExtract | exp.JSONExtractScalar, name: str
+) -> str:
+    # HANA only accepts a single, literal JSON path
+    path = expression.expression
+    if expression.expressions or not isinstance(path, (exp.JSONPath, exp.Literal)):
+        self.unsupported(f"{name} requires a single literal JSON path in SAP HANA.")
+        return self.function_fallback_sql(expression)
+    return self.func(name, expression.this, path)
+
+
 def _to_varchar_sql(self: HanaGenerator, expression: exp.ToChar | exp.TimeToStr) -> str:
     fmt = expression.args.get("format")
     return self.func("TO_VARCHAR", expression.this, self.format_time(expression) if fmt else None)
@@ -243,7 +353,9 @@ class HanaGenerator(generator.Generator):
         exp.DType.JSONB: "NCLOB",
         exp.DType.NVARCHAR: "NVARCHAR",
         exp.DType.TIMESTAMPNTZ: "TIMESTAMP",
+        exp.DType.TIMESTAMPLTZ: "TIMESTAMP",
         exp.DType.TIMESTAMPTZ: "TIMESTAMP",
+        exp.DType.TIMETZ: "TIME",
         exp.DType.TIMESTAMP_S: "SECONDDATE",
         exp.DType.UTINYINT: "TINYINT",
         exp.DType.UUID: "VARBINARY(16)",
@@ -251,7 +363,12 @@ class HanaGenerator(generator.Generator):
 
     TRANSFORMS = {
         **generator.Generator.TRANSFORMS,
+        **{e: _unsupported_sql for e in UNSUPPORTED_EXPRESSIONS},
+        exp.ApproxDistinct: lambda self, e: self.func("COUNT", exp.Distinct(expressions=[e.this])),
         exp.Chr: rename_func("CHAR"),
+        exp.CountIf: lambda self, e: self.func(
+            "COUNT", exp.case().when(e.this, exp.Literal.number(1))
+        ),
         exp.Concat: concat_to_dpipe_sql,
         exp.ConcatWs: concat_ws_to_dpipe_sql,
         exp.CurrentUser: lambda *_: "CURRENT_USER",
@@ -265,7 +382,12 @@ class HanaGenerator(generator.Generator):
         exp.DayOfMonth: rename_func("DAYOFMONTH"),
         exp.DayOfYear: rename_func("DAYOFYEAR"),
         exp.DecodeCase: rename_func("MAP"),
+        exp.Filter: no_filter_sql,
         exp.ILike: no_ilike_sql,
+        exp.JSONExtract: lambda self, e: _json_extract_sql(self, e, "JSON_QUERY"),
+        exp.JSONExtractScalar: lambda self, e: _json_extract_sql(self, e, "JSON_VALUE"),
+        exp.Localtime: lambda *_: "CURRENT_TIME",
+        exp.Localtimestamp: lambda *_: "CURRENT_TIMESTAMP",
         exp.MD5: lambda self, e: _hash_sql(self, "HASH_MD5", e, hex=True),
         exp.MD5Digest: lambda self, e: _hash_sql(self, "HASH_MD5", e, hex=False),
         exp.Mod: rename_func("MOD"),
@@ -286,10 +408,12 @@ class HanaGenerator(generator.Generator):
         exp.TryCast: no_trycast_sql,
         exp.TsOrDsAdd: _date_add_sql,
         exp.TsOrDsDiff: _date_diff_sql,
+        exp.Unhex: rename_func("HEXTOBIN"),
         exp.Select: transforms.preprocess(
             [
                 _add_dummy_from,
                 _alias_derived_table_columns,
+                _fix_booleans,
                 transforms.eliminate_distinct_on,
                 transforms.eliminate_qualify,
                 transforms.eliminate_semi_and_anti_joins,
@@ -389,6 +513,95 @@ class HanaGenerator(generator.Generator):
             args.append(occurrence)
 
         return self.func("LOCATE", *args)
+
+    def nullsafeeq_sql(self, expression: exp.NullSafeEQ) -> str:
+        return self.sql(exp.paren(_null_safe_eq(expression.this, expression.expression)))
+
+    def nullsafeneq_sql(self, expression: exp.NullSafeNEQ) -> str:
+        return self.sql(
+            exp.Not(this=exp.paren(_null_safe_eq(expression.this, expression.expression)))
+        )
+
+    def bracket_sql(self, expression: exp.Bracket) -> str:
+        expressions = self.bracket_offset_expressions(expression)
+        if expression.args.get("json_access") or len(expressions) != 1:
+            self.unsupported("SAP HANA only supports single-index array access.")
+            return super().bracket_sql(expression)
+        return self.func("MEMBER_AT", expression.this, expressions[0])
+
+    def date_sql(self, expression: exp.Date) -> str:
+        if expression.args.get("zone") or expression.expressions:
+            self.unsupported("DATE with a time zone or parts is not supported in SAP HANA.")
+            return self.function_fallback_sql(expression)
+        return self.sql(exp.cast(expression.this, exp.DType.DATE))
+
+    def datefromparts_sql(self, expression: exp.DateFromParts) -> str:
+        return self.sql(self._date_from_parts(expression))
+
+    def _date_from_parts(self, expression: exp.Expr) -> exp.Expr:
+        parts = {k: expression.args.get(k) or exp.Literal.number(1) for k in ("month", "day")}
+        return exp.replace_placeholders(
+            DATE_FROM_PARTS_TEMPLATE.copy(), year=expression.args.get("year"), **parts
+        )
+
+    def timestampfromparts_sql(self, expression: exp.TimestampFromParts) -> str:
+        if not expression.args.get("year") or any(
+            expression.args.get(k) for k in ("nano", "milli", "zone")
+        ):
+            self.unsupported("This TIMESTAMP_FROM_PARTS form is not supported in SAP HANA.")
+            return self.function_fallback_sql(expression)
+
+        date = exp.cast(self._date_from_parts(expression), exp.DType.TIMESTAMP)
+        return self.func("ADD_SECONDS", date, self._seconds_of_day(expression))
+
+    def timefromparts_sql(self, expression: exp.TimeFromParts) -> str:
+        if expression.args.get("nano") or expression.args.get("fractions"):
+            self.unsupported("Fractional seconds in TIME_FROM_PARTS are not supported in SAP HANA.")
+        midnight = exp.func("TO_TIME", exp.Literal.string("00:00:00"))
+        return self.func("ADD_SECONDS", midnight, self._seconds_of_day(expression))
+
+    def _seconds_of_day(self, expression: exp.Expr) -> exp.Expr:
+        hour, minute, second = (
+            expression.args.get(k) or exp.Literal.number(0) for k in ("hour", "min", "sec")
+        )
+        return hour * exp.Literal.number(3600) + minute * exp.Literal.number(60) + second
+
+    def unixtotime_sql(self, expression: exp.UnixToTime) -> str:
+        scale = expression.args.get("scale")
+        if any(expression.args.get(k) for k in ("zone", "hours", "minutes", "format")) or (
+            scale and not scale.is_int
+        ):
+            self.unsupported("This UNIX timestamp conversion is not supported in SAP HANA.")
+            return self.function_fallback_sql(expression)
+
+        seconds = expression.this
+        if scale and scale.to_py():
+            seconds = seconds / exp.Literal.number(10 ** scale.to_py())
+        return self.func("ADD_SECONDS", EPOCH.copy(), seconds)
+
+    def timetounix_sql(self, expression: exp.TimeToUnix) -> str:
+        return self.func("SECONDS_BETWEEN", EPOCH.copy(), expression.this)
+
+    def regexpextract_sql(self, expression: exp.RegexpExtract) -> str:
+        # SUBSTR_REGEXPR(<pattern> IN <string> [FROM <start>] [OCCURRENCE <n>] [GROUP <n>])
+        sql = self.sql(expression, "expression")
+        if expression.args.get("parameters"):
+            sql = f"{sql} FLAG {self.sql(expression, 'parameters')}"
+        sql = f"{sql} IN {self.sql(expression, 'this')}"
+        for key, keyword in (
+            ("position", "FROM"),
+            ("occurrence", "OCCURRENCE"),
+            ("group", "GROUP"),
+        ):
+            value = expression.args.get(key)
+            if value:
+                sql = f"{sql} {keyword} {self.sql(value)}"
+        return f"SUBSTR_REGEXPR({sql})"
+
+    def join_sql(self, expression: exp.Join, join_op: str | None = None) -> str:
+        if expression.method.upper() == "NATURAL":
+            self.unsupported("SAP HANA does not support NATURAL joins.")
+        return super().join_sql(expression, join_op)
 
     def splitpart_sql(self, expression: exp.SplitPart) -> str:
         self.unsupported("SAP HANA has no SPLIT_PART function.")

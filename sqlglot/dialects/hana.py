@@ -33,6 +33,7 @@ _TIME_ELEMENTS = {
 class Hana(Dialect):
     NORMALIZATION_STRATEGY = NormalizationStrategy.UPPERCASE
     TABLESAMPLE_SIZE_IS_PERCENT = True
+    INDEX_OFFSET = 1
 
     # Format elements are case-insensitive
     TIME_MAPPING = {

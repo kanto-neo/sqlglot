@@ -92,6 +92,11 @@ class HanaParser(parser.Parser):
         "TO_VARCHAR": build_timetostr_or_tochar,
     }
 
+    FUNCTION_PARSERS = {
+        **parser.Parser.FUNCTION_PARSERS,
+        "SUBSTR_REGEXPR": lambda self: self._parse_substr_regexpr(),
+    }
+
     NO_PAREN_FUNCTIONS = {
         **parser.Parser.NO_PAREN_FUNCTIONS,
         TokenType.UTC_DATE: exp.UtcDate,
@@ -108,6 +113,25 @@ class HanaParser(parser.Parser):
         expression = self._parse_bitwise()
         flag = self._parse_string() if self._match_text_seq("FLAG") else None
         return self.expression(exp.RegexpLike(this=this, expression=expression, flag=flag))
+
+    def _parse_substr_regexpr(self) -> exp.RegexpExtract:
+        # SUBSTR_REGEXPR(<pattern> [FLAG <flags>] IN <string> [FROM <n>] [OCCURRENCE <n>] [GROUP <n>])
+        pattern = self._parse_bitwise()
+        flags = self._parse_string() if self._match_text_seq("FLAG") else None
+        self._match(TokenType.IN)
+        args: dict[str, t.Any] = {"this": self._parse_bitwise(), "expression": pattern}
+        if flags:
+            args["parameters"] = flags
+
+        for key, keyword in (
+            ("position", "FROM"),
+            ("occurrence", "OCCURRENCE"),
+            ("group", "GROUP"),
+        ):
+            if self._match_text_seq(keyword):
+                args[key] = self._parse_bitwise()
+
+        return self.expression(exp.RegexpExtract(**args))
 
     def _parse_locks(self) -> list[exp.Lock]:
         # FOR SHARE LOCK and IGNORE LOCKED are HANA's spellings of FOR SHARE and SKIP LOCKED
