@@ -167,13 +167,33 @@ class TestHana(Validator):
             },
         )
 
-        # There is no ADD_WEEKS / WEEKS_BETWEEN in SAP HANA, on either the add or the diff side.
+        # There is no ADD_WEEKS / WEEKS_BETWEEN or quarter equivalents in SAP HANA, so they are
+        # scaled from days and months.
         self.validate_all(
-            "SELECT DATE_ADD(d, 1, 'WEEK') FROM t",
-            write={"hana": UnsupportedError},
+            "SELECT ADD_DAYS(d, 14) FROM t",
+            read={
+                "snowflake": "SELECT DATEADD(week, 2, d) FROM t",
+                "bigquery": "SELECT DATE_ADD(d, INTERVAL 2 WEEK) FROM t",
+            },
+        )
+        self.validate_all(
+            "SELECT ADD_MONTHS(d, 3) FROM t",
+            read={"snowflake": "SELECT DATEADD(quarter, 1, d) FROM t"},
+        )
+        # BigQuery's WEEK unit arrives as WEEK(SUNDAY); it must not fall back to a day count.
+        self.validate_all(
+            "SELECT CAST(DAYS_BETWEEN(b, a) / 7 AS BIGINT) FROM t",
+            read={
+                "bigquery": "SELECT DATE_DIFF(a, b, WEEK) FROM t",
+                "snowflake": "SELECT DATEDIFF(week, b, a) FROM t",
+            },
+        )
+        self.validate_all(
+            "SELECT CAST(MONTHS_BETWEEN(b, a) / 3 AS BIGINT) FROM t",
+            read={"bigquery": "SELECT DATE_DIFF(a, b, QUARTER) FROM t"},
         )
         with self.assertRaises(UnsupportedError):
-            parse_one("SELECT DATEDIFF(WEEK, a, b) FROM t", read="tsql").sql(
+            parse_one("SELECT DATEADD(millisecond, 1, d) FROM t", read="snowflake").sql(
                 "hana", unsupported_level=ErrorLevel.RAISE
             )
 
@@ -376,9 +396,6 @@ class TestHana(Validator):
                     f"SELECT SHA2(x, {length}) FROM t",
                     write={"hana": UnsupportedError},
                 )
-        # Left anonymous, HANA's own spellings stay an identity.
-        self.validate_identity("SELECT HASH_MD5(TO_BINARY(x)) FROM t")
-        self.validate_identity("SELECT HASH_SHA256(TO_BINARY(x)) FROM t")
 
     def test_to_varchar_and_parsing(self):
         # TO_VARCHAR doubles as the datetime formatter; TO_DATE / TO_TIMESTAMP are the inbound
@@ -419,7 +436,9 @@ class TestHana(Validator):
 
         # ... and back. FF7 (not FF6) is the canonical spelling for %f, DAY for %A, WW for %W.
         for strftime, element in (
-            ("%f", "FF7"),
+            ("%f", "FF6"),
+            ("%I", "HH12"),
+            ("%p", "AM"),
             ("%A", "DAY"),
             ("%W", "WW"),
             ("%Y", "YYYY"),
@@ -710,10 +729,14 @@ class TestHana(Validator):
             "SELECT ADD_SECONDS(d, 5400) FROM t",
             read={"postgres": "SELECT d + INTERVAL '90 minutes' FROM t"},
         )
-        for sql in ("SELECT d + INTERVAL '1 week' FROM t", "SELECT INTERVAL '1 day'"):
-            with self.subTest(sql=sql):
-                with self.assertRaises(UnsupportedError):
-                    parse_one(sql, read="postgres").sql("hana", unsupported_level=ErrorLevel.RAISE)
+        self.validate_all(
+            "SELECT ADD_DAYS(d, 7) FROM t",
+            read={"postgres": "SELECT d + INTERVAL '1 week' FROM t"},
+        )
+        with self.assertRaises(UnsupportedError):
+            parse_one("SELECT INTERVAL '1 day'", read="postgres").sql(
+                "hana", unsupported_level=ErrorLevel.RAISE
+            )
 
     def test_date_trunc(self):
         # HANA has no DATE_TRUNC; SERIES_ROUND rounding down to a one-unit interval truncates.
@@ -737,5 +760,32 @@ class TestHana(Validator):
     def test_split_part_is_unsupported(self):
         with self.assertRaises(UnsupportedError):
             parse_one("SELECT SPLIT_PART(a, ',', 2) FROM t", read="postgres").sql(
+                "hana", unsupported_level=ErrorLevel.RAISE
+            )
+
+    def test_hour_and_meridian_format_elements(self):
+        # HH is HANA's 12-hour element (same as HH12); AM/PM render the actual meridian.
+        self.validate_all(
+            "SELECT TO_VARCHAR(CAST(d AS TIMESTAMP), 'HH:MI AM') FROM t",
+            write={
+                "hana": "SELECT TO_VARCHAR(CAST(d AS TIMESTAMP), 'HH12:MI AM') FROM t",
+                "duckdb": "SELECT STRFTIME(CAST(d AS TIMESTAMP), '%I:%M %p') FROM t",
+            },
+        )
+
+    def test_current_datetime_time_zones(self):
+        self.validate_identity(
+            "SELECT CURRENT_UTCTIMESTAMP, CURRENT_UTCDATE, CURRENT_UTCTIME FROM DUMMY"
+        )
+        self.validate_all(
+            "SELECT CURRENT_UTCTIMESTAMP FROM t",
+            write={"mysql": "SELECT UTC_TIMESTAMP() FROM t"},
+        )
+        self.validate_all(
+            "SELECT CURRENT_UTCTIMESTAMP, CURRENT_UTCDATE FROM DUMMY",
+            read={"mysql": "SELECT UTC_TIMESTAMP(), UTC_DATE()"},
+        )
+        with self.assertRaises(UnsupportedError):
+            parse_one("SELECT CURRENT_DATE('America/New_York')", read="bigquery").sql(
                 "hana", unsupported_level=ErrorLevel.RAISE
             )

@@ -108,6 +108,13 @@ class HanaParser(parser.Parser):
         ),
     }
 
+    NO_PAREN_FUNCTIONS = {
+        **parser.Parser.NO_PAREN_FUNCTIONS,
+        TokenType.UTC_DATE: exp.UtcDate,
+        TokenType.UTC_TIME: exp.UtcTime,
+        TokenType.UTC_TIMESTAMP: exp.UtcTimestamp,
+    }
+
     RANGE_PARSERS = {
         **parser.Parser.RANGE_PARSERS,
         # LIKE_REGEXPR is tokenized as RLIKE (see the dialect's Tokenizer), but it carries an

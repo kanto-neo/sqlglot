@@ -15,6 +15,7 @@ _TIME_ELEMENTS = {
     "DD": "%d",  # day of month (01-31)
     "DDD": "%j",  # day of year (001-366)
     "DY": "%a",  # abbreviated name of day
+    "HH": "%I",  # hour of day (01-12)
     "HH12": "%I",  # hour of day (01-12)
     "HH24": "%H",  # hour of day (00-23)
     "MI": "%M",  # minute (00-59)
@@ -25,8 +26,10 @@ _TIME_ELEMENTS = {
     "WW": "%W",  # week of year
     "YY": "%y",  # 26
     "YYYY": "%Y",  # 2026
-    # HANA's default timestamp format carries 7 fractional digits, but Python's %f is
-    # microseconds, so FF7 is a lossy match on the last digit.
+    "AM": "%p",  # meridian indicator; AM and PM both render the actual one
+    "PM": "%p",
+    # Python's %f is microseconds. FF7, HANA's default precision, has one more digit, so it is
+    # only accepted on the way in.
     "FF6": "%f",
     "FF7": "%f",
 }
@@ -56,11 +59,12 @@ class Hana(Dialect):
         "%B": "MONTH",
         "%b": "MON",
         "%d": "DD",
-        "%f": "FF7",
+        "%f": "FF6",
         "%H": "HH24",
         "%I": "HH12",
         "%j": "DDD",
         "%M": "MI",
+        "%p": "AM",
         "%m": "MM",
         "%S": "SS",
         "%W": "WW",
@@ -110,6 +114,10 @@ class Hana(Dialect):
             # reaches the other dialects' regex operators instead of failing to parse.
             # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/like-regexpr-predicate
             "LIKE_REGEXPR": TokenType.RLIKE,
+            # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/current-utctimestamp-function-datetime
+            "CURRENT_UTCDATE": TokenType.UTC_DATE,
+            "CURRENT_UTCTIME": TokenType.UTC_TIME,
+            "CURRENT_UTCTIMESTAMP": TokenType.UTC_TIMESTAMP,
         }
 
     Parser = HanaParser
