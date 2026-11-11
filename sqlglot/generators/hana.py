@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import typing as t
-
 from sqlglot import exp, generator, transforms
 from sqlglot.dialects.dialect import (
     concat_to_dpipe_sql,
@@ -15,32 +13,17 @@ from sqlglot.dialects.dialect import (
 )
 from sqlglot.parsers.hana import DATE_UNITS
 
-# SAP HANA parses OFFSET only as part of a LIMIT clause -- `<limit_clause> ::= LIMIT
-# <unsigned_integer> [ OFFSET <unsigned_integer> ]` -- so an offset-only query needs a limit
-# synthesised. The value is a sentinel, not a documented bound: SAP states no maximum for LIMIT.
-# It is the constant SAP's own sqlalchemy-hana dialect injects for this case, reused here so the
-# two emit the same SQL.
-# https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/select-statement-data-manipulation
+# HANA only accepts OFFSET after a LIMIT; this is the value SAP's sqlalchemy-hana uses
 MAX_LIMIT = 2147384648
 
-# EXTRACT accepts exactly these six parts in SAP HANA.
-# https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/extract-function-datetime
 EXTRACT_NATIVE_PARTS = {"YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"}
-
-# Parts EXTRACT rejects, but which HANA exposes as an INTEGER-returning scalar function.
-# ISOWEEK and QUARTER are deliberately absent: HANA's ISOWEEK returns 'YYYY-Www' and its QUARTER
-# returns 'YYYY-Qn', both strings, so neither can stand in for an integer date part.
-# HANA's WEEK is also not ISO-week numbered, which is noted where it is used.
 EXTRACT_FUNCTION_BY_PART = {
-    "WEEK": "WEEK",
     "DAYOFMONTH": "DAYOFMONTH",
     "DAYOFYEAR": "DAYOFYEAR",
     "DOY": "DAYOFYEAR",
 }
 
-# HANA has no ADD_HOURS / ADD_MINUTES / ADD_WEEKS / ADD_QUARTERS (nor the matching _BETWEEN
-# functions), so those units are expressed as a multiple of one HANA does have. Hibernate's
-# HANADialect uses the same rewrite for hours and minutes.
+# Units without an ADD_<unit>S / <unit>S_BETWEEN function, expressed through one that has
 SCALED_UNITS = {
     "HOUR": ("SECOND", 3600),
     "MINUTE": ("SECOND", 60),
@@ -48,7 +31,6 @@ SCALED_UNITS = {
     "QUARTER": ("MONTH", 3),
 }
 
-# DATE_TRUNC units that SERIES_ROUND can express as a single interval.
 TRUNC_INTERVAL_BY_UNIT = {
     "YEAR": "INTERVAL 1 YEAR",
     "QUARTER": "INTERVAL 3 MONTH",
@@ -59,86 +41,43 @@ TRUNC_INTERVAL_BY_UNIT = {
     "SECOND": "INTERVAL 1 SECOND",
 }
 
-# SAP HANA has no DAYOFWEEK; WEEKDAY is Monday(0)..Sunday(6). exp.DayOfWeek uses MySQL's
-# Sunday(1)..Saturday(7), so the value has to be rotated, and ISO-8601 is Monday(1)..Sunday(7).
-# https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/weekday-function-datetime
+# WEEKDAY is Monday(0)..Sunday(6); exp.DayOfWeek is Sunday(1)..Saturday(7)
 DAY_OF_WEEK_TEMPLATE: exp.Expr = exp.maybe_parse("(MOD(WEEKDAY(:this) + 1, 7) + 1)")
 DAY_OF_WEEK_ISO_TEMPLATE: exp.Expr = exp.maybe_parse("(WEEKDAY(:this) + 1)")
-
-# HANA's QUARTER() returns the string 'YYYY-Qn', so an integer quarter is computed. FLOOR is
-# needed because HANA's `/` is true division.
+# QUARTER and ISOWEEK return strings ('2024-Q2', '2024-W05')
 QUARTER_TEMPLATE: exp.Expr = exp.maybe_parse("(FLOOR((MONTH(:this) - 1) / 3) + 1)")
-
-# The interval-adding and interval-subtracting expressions this dialect routes through one
-# pair of helpers. All are exp.Func subclasses carrying `this`, `expression` and `unit`.
-DateDelta = t.Union[
-    exp.DateAdd,
-    exp.DateDiff,
-    exp.DateSub,
-    exp.DatetimeAdd,
-    exp.DatetimeDiff,
-    exp.DatetimeSub,
-    exp.TimeAdd,
-    exp.TimeDiff,
-    exp.TimeSub,
-    exp.TimestampAdd,
-    exp.TimestampDiff,
-    exp.TimestampSub,
-    exp.TsOrDsAdd,
-    exp.TsOrDsDiff,
-]
-
-
-def _hash_sql(self: HanaGenerator, func_name: str, this: exp.Expr) -> str:
-    """Render a hash as a hex STRING, which is what exp.MD5 / exp.SHA2 denote.
-
-    Two conversions are needed, in both directions: HASH_MD5 / HASH_SHA256 take a BINARY argument,
-    and they RETURN a VARBINARY, whereas every other dialect's MD5()/SHA2() returns the hex text.
-    BINTOHEX closes that second half -- without it the value is binary, not the hex digest, and
-    comparing it against a hex literal silently never matches. BINTOHEX emits uppercase digits
-    while other engines' hex digests are lowercase, hence the LOWER.
-    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/hash-md5-function-miscellaneous
-    """
-    return self.func(
-        "LOWER", exp.func("BINTOHEX", exp.func(func_name, exp.func("TO_BINARY", this)))
-    )
-
-
-def _to_varchar_sql(self: HanaGenerator, expression: exp.ToChar | exp.TimeToStr) -> str:
-    # TO_VARCHAR doubles as the datetime formatter; a NULL format model means a plain conversion.
-    # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/to-varchar-function-data-type-conversion
-    fmt = expression.args.get("format")
-    return self.func("TO_VARCHAR", expression.this, self.format_time(expression) if fmt else None)
+WEEK_ISO_TEMPLATE: exp.Expr = exp.maybe_parse("CAST(SUBSTRING(ISOWEEK(:this), 7, 2) AS INT)")
 
 
 def _unit_name(expression: exp.Expr) -> str:
-    # BigQuery's WEEK(<day>) arrives as exp.WeekStart; plural/abbreviated units are normalized.
     unit = unit_to_var(expression)
     if isinstance(unit, exp.WeekStart):
         return "WEEK"
-
     return map_date_part(unit).name.upper() if unit else "DAY"
 
 
-def _scale(offset: exp.Expr, factor: int) -> exp.Expr:
-    """Scale an offset for the SCALED_UNITS rewrites.
-
-    A numeric literal is folded so the output reads `ADD_SECONDS(d, 10800)` rather than
-    `3 * 3600`; this also covers the dialects that hand the offset over as a *string* literal,
-    where `'3' * 3600` would otherwise be emitted.
-    """
-    if isinstance(offset, exp.Literal):
+def _to_number(value: exp.Expr) -> exp.Expr:
+    # Several dialects carry interval amounts as string literals
+    if value.is_string:
         try:
-            return exp.Literal.number(int(offset.name) * factor)
+            number = float(value.name)
         except ValueError:
-            pass
+            return value
+        return exp.Literal.number(int(number) if number.is_integer() else number)
+    return value
 
+
+def _scale(offset: exp.Expr, factor: int) -> exp.Expr:
+    offset = _to_number(offset)
+    if offset.is_number:
+        number = offset.to_py() * factor
+        return exp.Literal.number(int(number) if float(number).is_integer() else number)
     return offset * exp.Literal.number(factor)
 
 
-def _date_add_sql(self: HanaGenerator, expression: DateDelta) -> str:
+def _date_add_sql(self: HanaGenerator, expression: exp.Func) -> str:
     unit = _unit_name(expression)
-    offset = expression.expression
+    offset = _to_number(expression.expression)
 
     if unit in SCALED_UNITS:
         unit, factor = SCALED_UNITS[unit]
@@ -151,27 +90,11 @@ def _date_add_sql(self: HanaGenerator, expression: DateDelta) -> str:
     return self.func(f"ADD_{unit}S", expression.this, offset)
 
 
-def _date_sub_sql(self: HanaGenerator, expression: DateDelta) -> str:
-    """Render the subtracting variants by negating the offset and reusing the ADD path.
-
-    SAP HANA has no SUBTRACT_<unit>S family. The offset is negated numerically rather than
-    wrapped in exp.Neg, because for several dialects it arrives as a *string* literal and
-    `-'3'` is not valid SQL.
-    """
-    offset = expression.expression
-    negated: exp.Expr
-
-    if isinstance(offset, exp.Neg):
-        negated = offset.this
-    elif isinstance(offset, exp.Literal) and not offset.args.get("is_string"):
-        negated = exp.Literal.number(f"-{offset.name}")
-    elif isinstance(offset, exp.Literal):
-        try:
-            negated = exp.Literal.number(-int(offset.name))
-        except ValueError:
-            negated = exp.Neg(this=exp.paren(offset, copy=True))
-    else:
-        negated = exp.Neg(this=exp.paren(offset, copy=True))
+def _date_sub_sql(self: HanaGenerator, expression: exp.Func) -> str:
+    offset = _to_number(expression.expression)
+    negated = offset.this if isinstance(offset, exp.Neg) else exp.Neg(this=exp.paren(offset))
+    if offset.is_number:
+        negated = exp.Literal.number(-offset.to_py())
 
     return _date_add_sql(
         self,
@@ -179,27 +102,22 @@ def _date_sub_sql(self: HanaGenerator, expression: DateDelta) -> str:
     )
 
 
-def _interval_to_date_add(this: exp.Expr, interval: exp.Interval) -> exp.DateAdd:
-    # INTERVAL '1' DAY carries its amount as a string, which ADD_<unit>S would take as text.
-    amount = interval.this
-    if amount.is_string and amount.name.lstrip("-").isdigit():
-        amount = exp.Literal.number(amount.name)
-
-    return exp.DateAdd(this=this, expression=amount, unit=interval.unit)
-
-
-def _date_diff_sql(self: HanaGenerator, expression: DateDelta) -> str:
+def _date_diff_sql(self: HanaGenerator, expression: exp.Func) -> str:
     unit = _unit_name(expression)
 
-    # <unit>S_BETWEEN(<start>, <end>) counts forward from the first argument, which is the
-    # opposite of the (end, start) order exp.DateDiff stores.
+    # <unit>S_BETWEEN(start, end) evaluates to end - start
     start, end = expression.expression, expression.this
 
+    # Dialects such as Snowflake count unit boundaries rather than elapsed units
+    if expression.args.get("date_part_boundary"):
+        interval = TRUNC_INTERVAL_BY_UNIT.get(unit)
+        if not interval:
+            self.unsupported(f"Counting {unit} boundaries is not supported in SAP HANA.")
+        else:
+            start, end = (_series_round_down(e, interval) for e in (start, end))
+
     if unit in SCALED_UNITS:
-        # HANA's `/` is true division, and casting the quotient to an integer type truncates
-        # toward zero, which is what a difference in whole units means (1h31m is 1 hour, -1h31m
-        # is -1). This measures elapsed whole units rather than counting boundary crossings the
-        # way T-SQL's DATEDIFF does.
+        # Casting truncates toward zero, i.e. counts whole elapsed units
         base_unit, factor = SCALED_UNITS[unit]
         between = exp.func(f"{base_unit}S_BETWEEN", start, end)
         return self.sql(exp.cast(between / exp.Literal.number(factor), exp.DType.BIGINT))
@@ -211,119 +129,153 @@ def _date_diff_sql(self: HanaGenerator, expression: DateDelta) -> str:
     return self.func(f"{unit}S_BETWEEN", start, end)
 
 
-def _date_trunc_sql(self: HanaGenerator, expression: exp.DateTrunc | exp.TimestampTrunc) -> str:
-    """HANA has no DATE_TRUNC; SERIES_ROUND rounding down to a one-unit interval truncates.
+def _series_round_down(this: exp.Expr, interval: str) -> exp.Expr:
+    return exp.func("SERIES_ROUND", this, exp.Literal.string(interval), exp.var("ROUND_DOWN"))
 
-    Week truncation is refused: SERIES_ROUND aligns intervals to a fixed origin, so a 7-day
-    interval does not start on a Monday.
-    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/series-round-function-series-data
-    """
+
+def _date_trunc_sql(self: HanaGenerator, expression: exp.DateTrunc | exp.TimestampTrunc) -> str:
     unit = _unit_name(expression)
     interval = TRUNC_INTERVAL_BY_UNIT.get(unit)
 
+    # SERIES_ROUND aligns intervals to a fixed origin, so weeks wouldn't start on Monday
     if not interval:
         self.unsupported(f"Truncating to {unit} is not supported in SAP HANA.")
         return self.function_fallback_sql(expression)
 
-    return self.func(
-        "SERIES_ROUND", expression.this, exp.Literal.string(interval), exp.var("ROUND_DOWN")
-    )
+    return self.sql(_series_round_down(expression.this, interval))
+
+
+def _hash_sql(self: HanaGenerator, func_name: str, expression: exp.Func, hex: bool) -> str:
+    length = expression.text("length") or "256"
+    if length != "256":
+        self.unsupported(f"SHA2 with length {length} is not supported in SAP HANA.")
+        return self.function_fallback_sql(expression)
+
+    # HASH_* take and return VARBINARY; other dialects' hex digests are lowercase
+    digest = exp.func(func_name, exp.func("TO_BINARY", expression.this))
+    return self.func("LOWER", exp.func("BINTOHEX", digest)) if hex else self.sql(digest)
+
+
+def _to_varchar_sql(self: HanaGenerator, expression: exp.ToChar | exp.TimeToStr) -> str:
+    fmt = expression.args.get("format")
+    return self.func("TO_VARCHAR", expression.this, self.format_time(expression) if fmt else None)
+
+
+def _alias_derived_table_columns(expression: exp.Expr) -> exp.Expr:
+    # HANA rejects `(<query>) AS t(a, b)`, so the names become aliases of the projections
+    if not isinstance(expression, exp.Select):
+        return expression
+
+    for source in (expression.args.get("from_"), *expression.args.get("joins", [])):
+        subquery = source.this if source else None
+        if not isinstance(subquery, exp.Subquery):
+            continue
+
+        alias = subquery.args.get("alias")
+        if not alias or not alias.columns:
+            continue
+
+        columns = alias.columns
+        select = subquery.this
+        while isinstance(select, exp.SetOperation):
+            select = select.this
+
+        if (
+            isinstance(select, exp.Select)
+            and len(select.expressions) == len(columns)
+            and not select.is_star
+        ):
+            select.set(
+                "expressions",
+                [exp.alias_(p.unalias(), c) for p, c in zip(select.expressions, columns)],
+            )
+            alias.set("columns", None)
+
+    return expression
 
 
 def _add_dummy_from(expression: exp.Expr) -> exp.Expr:
-    # Every SELECT needs a FROM clause in SAP HANA; DUMMY is its one-row table.
-    if (
-        isinstance(expression, exp.Select)
-        and expression.expressions
-        and not expression.args.get("from_")
-    ):
+    # DUMMY is HANA's one-row table, standing in for a missing FROM or Oracle's DUAL
+    if not isinstance(expression, exp.Select) or not expression.expressions:
+        return expression
+
+    source = expression.args.get("from_")
+    table = source.this if source else None
+    is_dual = (
+        isinstance(table, exp.Table)
+        and table.name.upper() == "DUAL"
+        and not table.db
+        and not table.this.args.get("quoted")
+    )
+    if not source or is_dual:
         expression.set("from_", exp.From(this=exp.to_table("DUMMY")))
     return expression
 
 
 class HanaGenerator(generator.Generator):
-    # SAP HANA supports LIMIT but not FETCH FIRST, so a parsed FETCH is rewritten as a LIMIT.
     LIMIT_FETCH = "LIMIT"
-
-    # CLUSTER BY / DISTRIBUTE BY / SORT BY are Hive-family extensions; assigning the
-    # module-level dict drops them instead of emitting SQL HANA cannot parse.
+    VALUES_AS_TABLE = False
+    SUPPORTS_TABLE_ALIAS_COLUMNS = False
+    TABLESAMPLE_SIZE_IS_ROWS = False
     AFTER_HAVING_MODIFIER_TRANSFORMS = generator.AFTER_HAVING_MODIFIER_TRANSFORMS
-
-    # HANA has no optimizer-hint syntax of the T-SQL/Hive shapes these flags gate, no TRY_CAST,
-    # no UESCAPE, and LAST_DAY takes no date-part argument.
     JOIN_HINTS = False
     TABLE_HINTS = False
     QUERY_HINTS = False
     TRY_SUPPORTED = False
     SUPPORTS_UESCAPE = False
     LAST_DAY_SUPPORTS_DATE_PART = False
-
-    # ... but it does support locking reads, which the base default would silently discard.
     LOCKING_READS_SUPPORTED = True
-
-    # HANA's array length function is CARDINALITY, not the base default ARRAY_LENGTH.
-    # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/cardinality-function-array
     ARRAY_SIZE_NAME = "CARDINALITY"
-
-    # HANA's set operators take no ALL/DISTINCT qualifier, and it has neither TO_NUMBER nor NVL2.
     EXCEPT_INTERSECT_SUPPORT_ALL_CLAUSE = False
     SUPPORTS_TO_NUMBER = False
     NVL2_SUPPORTED = False
 
     TYPE_MAPPING = {
         **generator.Generator.TYPE_MAPPING,
-        # SAP HANA has no BINARY type -- VARBINARY covers both. Note a VARBINARY with no
-        # length is a ONE-BYTE column in HANA, so datatype_sql below routes the unbounded
-        # forms to BLOB instead.
         exp.DType.BINARY: "VARBINARY",
         exp.DType.BLOB: "BLOB",
         exp.DType.DATETIME: "TIMESTAMP",
-        # HANA's bare FLOAT is 64-bit, so it means DOUBLE, not FLOAT -- its 32-bit type is
-        # spelled REAL. Every dialect parses REAL to DType.FLOAT, so rendering that back as
-        # FLOAT here would silently widen a 32-bit column to 64-bit. Postgres and DuckDB, the
-        # other two dialects whose bare FLOAT is double-width, map it the same way.
-        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/numeric-data-types
+        # FLOAT is 64-bit in HANA; REAL is the 32-bit type
         exp.DType.FLOAT: "REAL",
-        # HANA's TEXT is a full-text search type, not a character type; NCLOB is the
-        # unbounded string type. https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/data-types
+        # TEXT is a full-text search type in HANA
         exp.DType.TEXT: "NCLOB",
         exp.DType.JSON: "NCLOB",
         exp.DType.JSONB: "NCLOB",
-        # NVARCHAR is HANA's canonical Unicode string type; the base maps it down to VARCHAR.
         exp.DType.NVARCHAR: "NVARCHAR",
         exp.DType.TIMESTAMPNTZ: "TIMESTAMP",
         exp.DType.TIMESTAMPTZ: "TIMESTAMP",
         exp.DType.TIMESTAMP_S: "SECONDDATE",
+        exp.DType.UTINYINT: "TINYINT",
         exp.DType.UUID: "VARBINARY(16)",
     }
 
     TRANSFORMS = {
         **generator.Generator.TRANSFORMS,
+        exp.Chr: rename_func("CHAR"),
         exp.Concat: concat_to_dpipe_sql,
         exp.ConcatWs: concat_ws_to_dpipe_sql,
+        exp.CurrentUser: lambda *_: "CURRENT_USER",
         exp.DateAdd: _date_add_sql,
         exp.DateDiff: _date_diff_sql,
+        exp.DatetimeAdd: _date_add_sql,
         exp.DatetimeDiff: _date_diff_sql,
+        exp.DatetimeSub: _date_sub_sql,
         exp.DateSub: _date_sub_sql,
         exp.DateTrunc: _date_trunc_sql,
-        exp.DatetimeAdd: _date_add_sql,
-        exp.DatetimeSub: _date_sub_sql,
-        # SAP HANA spells these without separators, unlike sqlglot's default rendering.
-        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/dayofmonth-function-datetime
         exp.DayOfMonth: rename_func("DAYOFMONTH"),
         exp.DayOfYear: rename_func("DAYOFYEAR"),
-        # HANA's code-point-to-character function is CHAR; it has no CHR, which is what the
-        # base generator emits.
-        exp.Chr: rename_func("CHAR"),
-        # HANA has no ILIKE; the case-insensitive comparison has to be spelled out.
+        exp.DecodeCase: rename_func("MAP"),
         exp.ILike: no_ilike_sql,
-        # HANA's arithmetic operators are only unary -, +, -, *, / -- modulo is a function.
+        exp.MD5: lambda self, e: _hash_sql(self, "HASH_MD5", e, hex=True),
+        exp.MD5Digest: lambda self, e: _hash_sql(self, "HASH_MD5", e, hex=False),
         exp.Mod: rename_func("MOD"),
+        exp.SHA2: lambda self, e: _hash_sql(self, "HASH_SHA256", e, hex=True),
+        exp.SHA2Digest: lambda self, e: _hash_sql(self, "HASH_SHA256", e, hex=False),
         exp.StrToDate: lambda self, e: self.func("TO_DATE", e.this, self.format_time(e)),
         exp.StrToTime: lambda self, e: self.func("TO_TIMESTAMP", e.this, self.format_time(e)),
-        exp.TimeStrToTime: rename_func("TO_TIMESTAMP"),
         exp.TimeAdd: _date_add_sql,
         exp.TimeDiff: _date_diff_sql,
+        exp.TimeStrToTime: rename_func("TO_TIMESTAMP"),
         exp.TimeSub: _date_sub_sql,
         exp.TimeToStr: _to_varchar_sql,
         exp.TimestampAdd: _date_add_sql,
@@ -331,17 +283,13 @@ class HanaGenerator(generator.Generator):
         exp.TimestampSub: _date_sub_sql,
         exp.TimestampTrunc: _date_trunc_sql,
         exp.ToChar: _to_varchar_sql,
+        exp.TryCast: no_trycast_sql,
         exp.TsOrDsAdd: _date_add_sql,
         exp.TsOrDsDiff: _date_diff_sql,
-        # HANA has no TRY_CAST; TRY_SUPPORTED only gates exp.Try, not exp.TryCast.
-        exp.TryCast: no_trycast_sql,
-        # HANA has no WEEK_OF_YEAR -- the function is WEEK, same as the EXTRACT(WEEK) path.
-        exp.WeekOfYear: rename_func("WEEK"),
-        # QUALIFY, SEMI/ANTI joins and DISTINCT ON have no HANA grammar, so they are rewritten
-        # into constructs that do rather than emitted verbatim.
         exp.Select: transforms.preprocess(
             [
                 _add_dummy_from,
+                _alias_derived_table_columns,
                 transforms.eliminate_distinct_on,
                 transforms.eliminate_qualify,
                 transforms.eliminate_semi_and_anti_joins,
@@ -350,23 +298,21 @@ class HanaGenerator(generator.Generator):
     }
 
     def currentdate_sql(self, expression: exp.CurrentDate) -> str:
-        return self._current_sql(expression, "DATE")
+        return self._current_sql(expression, "CURRENT_DATE", "CURRENT_UTCDATE")
 
     def currenttime_sql(self, expression: exp.CurrentTime) -> str:
-        return self._current_sql(expression, "TIME")
+        return self._current_sql(expression, "CURRENT_TIME", "CURRENT_UTCTIME")
 
     def currenttimestamp_sql(self, expression: exp.CurrentTimestamp) -> str:
-        return self._current_sql(expression, "TIMESTAMP")
+        return self._current_sql(expression, "CURRENT_TIMESTAMP", "CURRENT_UTCTIMESTAMP")
 
-    def _current_sql(self, expression: exp.Expr, kind: str) -> str:
-        # HANA's CURRENT_<kind> takes no time zone, but has CURRENT_UTC<kind> for UTC.
-        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/current-utctimestamp-function-datetime
+    def _current_sql(self, expression: exp.Expr, local: str, utc: str) -> str:
         zone = expression.this
         if zone and zone.name.upper() == "UTC":
-            return f"CURRENT_UTC{kind}"
+            return utc
         if zone:
-            self.unsupported(f"CURRENT_{kind} with a time zone is not supported in SAP HANA.")
-        return f"CURRENT_{kind}"
+            self.unsupported(f"{local} with a time zone is not supported in SAP HANA.")
+        return local
 
     def dayofweek_sql(self, expression: exp.DayOfWeek) -> str:
         return self.sql(exp.replace_placeholders(DAY_OF_WEEK_TEMPLATE.copy(), this=expression.this))
@@ -378,6 +324,9 @@ class HanaGenerator(generator.Generator):
 
     def quarter_sql(self, expression: exp.Quarter) -> str:
         return self.sql(exp.replace_placeholders(QUARTER_TEMPLATE.copy(), this=expression.this))
+
+    def weekofyear_sql(self, expression: exp.WeekOfYear) -> str:
+        return self.sql(exp.replace_placeholders(WEEK_ISO_TEMPLATE.copy(), this=expression.this))
 
     def extract_sql(self, expression: exp.Extract) -> str:
         part = expression.name.upper()
@@ -392,9 +341,9 @@ class HanaGenerator(generator.Generator):
 
         if part == "QUARTER":
             return self.quarter_sql(exp.Quarter(this=this))
-
-        # ISO-8601 pins ISODOW (Monday 1 .. Sunday 7). Plain DOW is deliberately not mapped:
-        # Postgres counts Sunday as 0 while exp.DayOfWeek counts it as 1.
+        if part == "WEEK":
+            return self.weekofyear_sql(exp.WeekOfYear(this=this))
+        # DOW is not mapped because its numbering differs between dialects
         if part == "ISODOW":
             return self.dayofweekiso_sql(exp.DayOfWeekIso(this=this))
 
@@ -402,150 +351,101 @@ class HanaGenerator(generator.Generator):
         return super().extract_sql(expression)
 
     def trim_sql(self, expression: exp.Trim) -> str:
-        """Render exp.Trim with SAP HANA's set semantics.
-
-        HANA's LTRIM/RTRIM take a set of characters, not a search string, which matches what
-        exp.Trim means, so the base rendering is right for LEADING and TRAILING. Only BOTH needs
-        handling: HANA has no two-argument TRIM(<str>, <set>).
-        https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/ltrim-function-string
-        """
+        # LTRIM/RTRIM remove a character set, but HANA has no two-argument TRIM for BOTH
         remove_set = expression.expression
-        position = self.sql(expression, "position")
-
-        if remove_set and position in ("", "BOTH"):
+        if remove_set and self.sql(expression, "position") in ("", "BOTH"):
             return self.func("LTRIM", self.func("RTRIM", expression.this, remove_set), remove_set)
-
         return super().trim_sql(expression)
 
     def groupconcat_sql(self, expression: exp.GroupConcat) -> str:
-        # HANA's STRING_AGG documents no default delimiter, so none is synthesized, and its
-        # grammar has no DISTINCT.
-        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/string-agg-function-aggregate
         if isinstance(expression.this, exp.Distinct):
             self.unsupported("SAP HANA's STRING_AGG does not support DISTINCT.")
-
         return groupconcat_sql(
             self, expression, func_name="STRING_AGG", sep=None, within_group=False
         )
 
     def repeat_sql(self, expression: exp.Repeat) -> str:
-        # HANA has no REPEAT; RPAD padded with the string itself is the idiom (Hibernate's
-        # HANADialect uses the same rewrite).
         this = expression.this
         times = expression.args.get("times")
-
         if not times:
             self.unsupported("REPEAT requires a repetition count in SAP HANA.")
             return self.function_fallback_sql(expression)
-
         return self.func("RPAD", this, times * exp.func("LENGTH", this.copy()), this.copy())
 
-    def md5_sql(self, expression: exp.MD5) -> str:
-        return _hash_sql(self, "HASH_MD5", expression.this)
-
-    def sha2_sql(self, expression: exp.SHA2) -> str:
-        length = expression.text("length") or "256"
-
-        # HASH_MD5 and HASH_SHA256 are the only hash functions SAP HANA documents.
-        if length != "256":
-            self.unsupported(f"SHA2 with length {length} is not supported in SAP HANA.")
-            return self.function_fallback_sql(expression)
-
-        return _hash_sql(self, "HASH_SHA256", expression.this)
-
     def regexplike_sql(self, expression: exp.RegexpLike) -> str:
-        # HANA's regex match is the LIKE_REGEXPR infix predicate, with an optional FLAG.
-        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/like-regexpr-predicate
         sql = self.binary(expression, "LIKE_REGEXPR")
         flag = expression.args.get("flag")
-
         return f"{sql} FLAG {self.sql(flag)}" if flag else sql
 
     def strposition_sql(self, expression: exp.StrPosition) -> str:
-        # LOCATE(<haystack>, <needle>[, <start>[, <occurrences>]]) takes the haystack first, the
-        # reverse of the MySQL/T-SQL LOCATE the shared strposition_sql helper assumes.
-        # https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/locate-function-string
+        # LOCATE(<haystack>, <needle>[, <start>[, <occurrence>]])
         args: list[exp.Expr] = [expression.this, expression.args["substr"]]
-
         position = expression.args.get("position")
         occurrence = expression.args.get("occurrence")
 
         if position or occurrence:
-            # <occurrences> is the fourth argument, so a bare occurrence still needs a start.
             args.append(position or exp.Literal.number(1))
         if occurrence:
             args.append(occurrence)
 
         return self.func("LOCATE", *args)
 
-    def md5digest_sql(self, expression: exp.MD5Digest) -> str:
-        # The binary digest is what HASH_MD5 returns natively; only the input needs converting.
-        return self.func("HASH_MD5", exp.func("TO_BINARY", expression.this))
-
-    def sha2digest_sql(self, expression: exp.SHA2Digest) -> str:
-        length = expression.text("length") or "256"
-        if length != "256":
-            self.unsupported(f"SHA2 with length {length} is not supported in SAP HANA.")
-            return self.function_fallback_sql(expression)
-
-        return self.func("HASH_SHA256", exp.func("TO_BINARY", expression.this))
-
     def splitpart_sql(self, expression: exp.SplitPart) -> str:
         self.unsupported("SAP HANA has no SPLIT_PART function.")
         return self.function_fallback_sql(expression)
 
     def interval_sql(self, expression: exp.Interval) -> str:
-        # Interval arithmetic is rewritten in add_sql / sub_sql; anywhere else it has no HANA form.
         self.unsupported("SAP HANA does not support INTERVAL literals.")
         return super().interval_sql(expression)
 
     def add_sql(self, expression: exp.Add) -> str:
-        # HANA has no INTERVAL type, so `<date> + INTERVAL ...` becomes ADD_<unit>S.
         this, interval = expression.this, expression.expression
         if isinstance(this, exp.Interval):
             this, interval = interval, this
 
-        if isinstance(interval, exp.Interval) and interval.unit:
-            return _date_add_sql(self, _interval_to_date_add(this, interval))
+        if (
+            isinstance(interval, exp.Interval)
+            and interval.unit
+            and not isinstance(this, exp.Interval)
+        ):
+            return _date_add_sql(
+                self, exp.DateAdd(this=this, expression=interval.this, unit=interval.unit)
+            )
 
         return super().add_sql(expression)
 
     def sub_sql(self, expression: exp.Sub) -> str:
-        interval = expression.expression
-        if isinstance(interval, exp.Interval) and interval.unit:
-            return _date_sub_sql(self, _interval_to_date_add(expression.this, interval))
+        this, interval = expression.this, expression.expression
+        if (
+            isinstance(interval, exp.Interval)
+            and interval.unit
+            and not isinstance(this, exp.Interval)
+        ):
+            return _date_sub_sql(
+                self, exp.DateSub(this=this, expression=interval.this, unit=interval.unit)
+            )
 
         return super().sub_sql(expression)
 
     def datatype_sql(self, expression: exp.DataType) -> str:
-        """Route an unbounded binary type to BLOB.
+        unbounded_binary = expression.is_type(exp.DType.BINARY, exp.DType.VARBINARY)
+        in_cast = isinstance(expression.parent, exp.Cast)
 
-        SAP HANA's VARBINARY takes a length between 1 and 5000 and "if the length is not
-        specified, then the default is 1" -- so rendering an unbounded binary column as a bare
-        VARBINARY would declare a ONE-BYTE column and silently truncate. BLOB is the unbounded
-        binary type.
-        https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/binary-data-types
-        """
-        if expression.is_type(exp.DType.BINARY, exp.DType.VARBINARY) and not expression.expressions:
-            return "BLOB"
+        # A VARBINARY column without a length holds one byte, but in a CAST it is unbounded
+        if unbounded_binary and not expression.expressions:
+            return "VARBINARY" if in_cast else "BLOB"
 
-        # HANA's FLOAT(<n>) is a *parameterized* float, 32- or 64-bit depending on n, and the
-        # tokenizer reads a bare FLOAT as DOUBLE (see the Tokenizer). A DOUBLE that kept a
-        # parameter can only have come from FLOAT(<n>), and DOUBLE takes no parameter in HANA,
-        # so it has to go back out under its original spelling.
+        # A parameterized DOUBLE can only come from HANA's FLOAT(<n>)
         if expression.is_type(exp.DType.DOUBLE) and expression.expressions:
             return self.func("FLOAT", *expression.expressions)
+
+        # LOBs can't be compared, grouped or sorted, and NVARCHAR is unbounded in a CAST
+        if expression.is_type(exp.DType.TEXT) and in_cast:
+            return "NVARCHAR"
 
         return super().datatype_sql(expression)
 
     def lock_sql(self, expression: exp.Lock) -> str:
-        """Render exp.Lock using SAP HANA's spellings.
-
-        HANA writes the shared lock as FOR SHARE LOCK rather than FOR SHARE, spells SKIP LOCKED
-        as IGNORE LOCKED, and has no Postgres-style KEY variants, so the base implementation
-        cannot be reused.
-        https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/select-statement-data-manipulation
-        """
         if expression.args.get("key"):
             self.unsupported("SAP HANA does not support FOR KEY SHARE / FOR NO KEY UPDATE.")
 
@@ -555,25 +455,26 @@ class HanaGenerator(generator.Generator):
         if expressions:
             sql = f"{sql} OF {expressions}"
 
-        if expression.args.get("wait") is not None:
-            wait = expression.args["wait"]
-            if isinstance(wait, exp.Expr):
-                sql = f"{sql} WAIT {self.sql(wait)}"
-            elif wait:
-                sql = f"{sql} NOWAIT"
-            else:
-                sql = f"{sql} IGNORE LOCKED"
+        wait = expression.args.get("wait")
+        if isinstance(wait, exp.Expr):
+            sql = f"{sql} WAIT {self.sql(wait)}"
+        elif wait is True:
+            sql = f"{sql} NOWAIT"
+        elif wait is False:
+            sql = f"{sql} IGNORE LOCKED"
 
         return sql
 
     def offset_limit_modifiers(
         self, expression: exp.Expr, fetch: bool, limit: exp.Fetch | exp.Limit | None
     ) -> list[str]:
-        offset = expression.args.get("offset")
+        # The base generator turns FETCH into a bare LIMIT before this point
+        original = expression.args.get("limit")
+        options = original.args.get("limit_options") if original else None
+        if options and (options.args.get("percent") or options.args.get("with_ties")):
+            self.unsupported("SAP HANA's LIMIT does not support PERCENT or WITH TIES.")
 
-        # SAP HANA parses OFFSET only as part of a LIMIT clause, so an offset with no limit
-        # needs one synthesised rather than emitted bare.
-        if offset and not limit:
+        if expression.args.get("offset") and not limit:
             limit = exp.Limit(expression=exp.Literal.number(MAX_LIMIT))
 
         return [self.sql(limit), self.sql(expression, "offset")]
