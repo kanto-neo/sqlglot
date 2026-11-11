@@ -15,9 +15,9 @@ class TestHana(Validator):
         self.validate_identity("SELECT a || b FROM t")
         self.validate_identity("SELECT COALESCE(a, b) FROM t")
         self.validate_identity("SELECT IFNULL(a, b) FROM t", "SELECT COALESCE(a, b) FROM t")
-        self.validate_identity("SELECT CURRENT_TIMESTAMP")
-        self.validate_identity("SELECT CURRENT_DATE")
-        self.validate_identity("SELECT CURRENT_TIME")
+        self.validate_identity("SELECT CURRENT_TIMESTAMP FROM DUMMY")
+        self.validate_identity("SELECT CURRENT_DATE FROM DUMMY")
+        self.validate_identity("SELECT CURRENT_TIME FROM DUMMY")
         self.validate_identity("SELECT a FROM t1 EXCEPT SELECT a FROM t2")
         self.validate_identity("SELECT a FROM t1 INTERSECT SELECT a FROM t2")
         self.validate_identity('SELECT "MixedCase" FROM t')
@@ -101,8 +101,8 @@ class TestHana(Validator):
         ):
             with self.subTest(type=source):
                 self.assertEqual(
-                    parse_one(f"SELECT CAST(a AS {source})").sql("hana"),
-                    f"SELECT CAST(a AS {expected})",
+                    parse_one(f"SELECT CAST(a AS {source}) FROM t").sql("hana"),
+                    f"SELECT CAST(a AS {expected}) FROM t",
                 )
 
     def test_offset_requires_limit(self):
@@ -290,25 +290,25 @@ class TestHana(Validator):
 
         # LOCATE(<haystack>, <needle>) takes the haystack first — the reverse of MySQL's LOCATE.
         self.validate_all(
-            "SELECT LOCATE(haystack, needle)",
+            "SELECT LOCATE(haystack, needle) FROM t",
             read={
-                "hana": "SELECT LOCATE(haystack, needle)",
-                "postgres": "SELECT POSITION(needle IN haystack)",
+                "hana": "SELECT LOCATE(haystack, needle) FROM t",
+                "postgres": "SELECT POSITION(needle IN haystack) FROM t",
             },
             write={
-                "hana": "SELECT LOCATE(haystack, needle)",
-                "mysql": "SELECT LOCATE(needle, haystack)",
+                "hana": "SELECT LOCATE(haystack, needle) FROM t",
+                "mysql": "SELECT LOCATE(needle, haystack) FROM t",
             },
         )
         # All four arities round-trip; the occurrence argument must not be dropped.
-        self.validate_identity("SELECT LOCATE(haystack, needle, 3)")
-        self.validate_identity("SELECT LOCATE(haystack, needle, 3, 2)")
+        self.validate_identity("SELECT LOCATE(haystack, needle, 3) FROM t")
+        self.validate_identity("SELECT LOCATE(haystack, needle, 3, 2) FROM t")
         self.validate_all(
-            "SELECT LOCATE(haystack, needle, 3, 2)",
-            read={"bigquery": "SELECT INSTR(haystack, needle, 3, 2)"},
+            "SELECT LOCATE(haystack, needle, 3, 2) FROM t",
+            read={"bigquery": "SELECT INSTR(haystack, needle, 3, 2) FROM t"},
             write={
-                "hana": "SELECT LOCATE(haystack, needle, 3, 2)",
-                "bigquery": "SELECT INSTR(haystack, needle, 3, 2)",
+                "hana": "SELECT LOCATE(haystack, needle, 3, 2) FROM t",
+                "bigquery": "SELECT INSTR(haystack, needle, 3, 2) FROM t",
             },
         )
 
@@ -448,9 +448,9 @@ class TestHana(Validator):
         # TRIM(LEADING 'ab' FROM ...), which removes a SUBSTRING and returns a different value.
         # A single-character set is the one case where the two agree, so it cannot be the only test.
         self.validate_all(
-            "SELECT LTRIM('babababAabend', 'ab')",
+            "SELECT LTRIM('babababAabend', 'ab') FROM DUMMY",
             read={"postgres": "SELECT LTRIM('babababAabend', 'ab')"},
-            write={"hana": "SELECT LTRIM('babababAabend', 'ab')"},
+            write={"hana": "SELECT LTRIM('babababAabend', 'ab') FROM DUMMY"},
         )
         self.validate_all(
             "SELECT RTRIM(a, 'xyz') FROM t",
@@ -459,9 +459,9 @@ class TestHana(Validator):
         )
         # BOTH has no two-argument TRIM in HANA, so it nests instead.
         self.validate_all(
-            "SELECT LTRIM(RTRIM(x, 'ab'), 'ab')",
-            read={"bigquery": "SELECT TRIM(x, 'ab')"},
-            write={"hana": "SELECT LTRIM(RTRIM(x, 'ab'), 'ab')"},
+            "SELECT LTRIM(RTRIM(x, 'ab'), 'ab') FROM t",
+            read={"bigquery": "SELECT TRIM(x, 'ab') FROM t"},
+            write={"hana": "SELECT LTRIM(RTRIM(x, 'ab'), 'ab') FROM t"},
         )
         for sql in ("SELECT LTRIM(a, 'ab') FROM t", "SELECT RTRIM(a, 'ab') FROM t"):
             with self.subTest(sql=sql):
@@ -471,16 +471,30 @@ class TestHana(Validator):
     def test_hash_returns_hex(self):
         # HASH_MD5/HASH_SHA256 take BINARY and RETURN VARBINARY, but exp.MD5/exp.SHA2 denote the
         # hex digest, so BINTOHEX is needed on the way out as well as TO_BINARY on the way in.
+        # BINTOHEX emits uppercase digits; other engines' hex digests are lowercase.
         self.validate_all(
-            "SELECT BINTOHEX(HASH_MD5(TO_BINARY(x))) FROM t",
+            "SELECT LOWER(BINTOHEX(HASH_MD5(TO_BINARY(x)))) FROM t",
             read={"postgres": "SELECT MD5(x) FROM t"},
-            write={"hana": "SELECT BINTOHEX(HASH_MD5(TO_BINARY(x))) FROM t"},
+            write={"hana": "SELECT LOWER(BINTOHEX(HASH_MD5(TO_BINARY(x)))) FROM t"},
         )
         self.validate_all(
-            "SELECT BINTOHEX(HASH_SHA256(TO_BINARY(x))) FROM t",
-            read={"postgres": "SELECT SHA256(x) FROM t"},
-            write={"hana": "SELECT BINTOHEX(HASH_SHA256(TO_BINARY(x))) FROM t"},
+            "SELECT LOWER(BINTOHEX(HASH_SHA256(TO_BINARY(x)))) FROM t",
+            read={"mysql": "SELECT SHA2(x, 256) FROM t"},
+            write={"hana": "SELECT LOWER(BINTOHEX(HASH_SHA256(TO_BINARY(x)))) FROM t"},
         )
+        # The binary digests are what HASH_MD5/HASH_SHA256 return natively.
+        self.validate_all(
+            "SELECT HASH_MD5(TO_BINARY(x)) FROM t",
+            read={"bigquery": "SELECT MD5(x) FROM t"},
+        )
+        self.validate_all(
+            "SELECT HASH_SHA256(TO_BINARY(x)) FROM t",
+            read={"postgres": "SELECT SHA256(x) FROM t", "bigquery": "SELECT SHA256(x) FROM t"},
+        )
+        with self.assertRaises(UnsupportedError):
+            parse_one("SELECT SHA512(x) FROM t", read="bigquery").sql(
+                "hana", unsupported_level=ErrorLevel.RAISE
+            )
 
     def test_binary_types(self):
         # A VARBINARY with no length is a ONE-BYTE column in HANA, so unbounded binary is BLOB.
@@ -492,15 +506,15 @@ class TestHana(Validator):
         # An explicit length is preserved rather than routed to BLOB.
         self.validate_identity("SELECT CAST(a AS VARBINARY(10)) FROM t")
         # Hex literals must not be swallowed: `0x0abc` once parsed as `0 AS x0abc`.
-        self.validate_identity("SELECT x'0abc'")
-        self.validate_identity("SELECT 0x0abc", "SELECT x'0abc'")
+        self.validate_identity("SELECT x'0abc' FROM DUMMY")
+        self.validate_identity("SELECT 0x0abc FROM DUMMY", "SELECT x'0abc' FROM DUMMY")
 
     def test_constructs_hana_lacks(self):
         # Each of these has no HANA grammar and must be rewritten, not emitted verbatim.
         self.validate_all(
-            "SELECT CAST(a AS INT)",
-            read={"tsql": "SELECT TRY_CAST(a AS INT)"},
-            write={"hana": "SELECT CAST(a AS INT)"},
+            "SELECT CAST(a AS INT) FROM t",
+            read={"tsql": "SELECT TRY_CAST(a AS INT) FROM t"},
+            write={"hana": "SELECT CAST(a AS INT) FROM t"},
         )
         self.validate_all(
             "SELECT a FROM t WHERE LOWER(b) LIKE LOWER('x%')",
@@ -567,11 +581,11 @@ class TestHana(Validator):
     def test_char_is_not_chr(self):
         # HANA's code-point-to-character function is CHAR; the base generator's CHR does not
         # exist there, so an unmapped exp.Chr would emit an unknown function.
-        self.validate_identity("SELECT CHAR(65)")
+        self.validate_identity("SELECT CHAR(65) FROM DUMMY")
         self.validate_all(
-            "SELECT CHAR(65)",
-            read={"postgres": "SELECT CHR(65)"},
-            write={"postgres": "SELECT CHR(65)", "tsql": "SELECT CHAR(65)"},
+            "SELECT CHAR(a) FROM t",
+            read={"postgres": "SELECT CHR(a) FROM t"},
+            write={"postgres": "SELECT CHR(a) FROM t", "tsql": "SELECT CHAR(a) FROM t"},
         )
 
     def test_top(self):
@@ -625,20 +639,15 @@ class TestHana(Validator):
         )
 
     def test_whole_unit_diff_truncates_toward_zero(self):
-        # Converting a fractional value to an integer type ROUNDS in HANA, so a bare CAST would
-        # report a whole extra unit past the half-way mark. ROUND_DOWN truncates toward zero.
-        for read, sql in (
-            ("snowflake", "SELECT DATEDIFF(hour, a, b)"),
-            ("snowflake", "SELECT DATEDIFF(minute, a, b)"),
-        ):
-            with self.subTest(sql=sql):
-                out = parse_one(sql, read=read).sql("hana")
-                self.assertIn("ROUND_DOWN", out)
-                self.assertIn("SECONDS_BETWEEN(a, b)", out)
-
+        # HANA's `/` is true division and casting a fraction to an integer type truncates
+        # toward zero, so 1h31m is 1 hour and -1h31m is -1.
         self.validate_all(
-            "SELECT CAST(ROUND(SECONDS_BETWEEN(a, b) / 3600, 0, ROUND_DOWN) AS BIGINT)",
-            read={"snowflake": "SELECT DATEDIFF(hour, a, b)"},
+            "SELECT CAST(SECONDS_BETWEEN(a, b) / 3600 AS BIGINT) FROM t",
+            read={"snowflake": "SELECT DATEDIFF(hour, a, b) FROM t"},
+        )
+        self.validate_all(
+            "SELECT CAST(SECONDS_BETWEEN(a, b) / 60 AS BIGINT) FROM t",
+            read={"snowflake": "SELECT DATEDIFF(minute, a, b) FROM t"},
         )
 
     def test_next_day_and_map_are_hana_shaped(self):
@@ -662,5 +671,71 @@ class TestHana(Validator):
         )
         with self.assertRaises(UnsupportedError):
             parse_one("SELECT EXTRACT(DOW FROM a) FROM t", read="postgres").sql(
+                "hana", unsupported_level=ErrorLevel.RAISE
+            )
+
+    def test_select_requires_from(self):
+        # Every SELECT needs a FROM clause in SAP HANA; DUMMY is its one-row table.
+        self.validate_identity("SELECT 1 FROM DUMMY")
+        self.validate_all(
+            "SELECT 1 FROM DUMMY",
+            read={"postgres": "SELECT 1"},
+        )
+        self.validate_all(
+            "SELECT x FROM (SELECT 1 AS x FROM DUMMY UNION ALL SELECT 2 FROM DUMMY) AS s",
+            read={"postgres": "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) AS s"},
+        )
+        self.validate_all(
+            "INSERT INTO t SELECT 1 FROM DUMMY", read={"postgres": "INSERT INTO t SELECT 1"}
+        )
+
+    def test_interval_arithmetic(self):
+        # HANA has no INTERVAL type, so interval arithmetic becomes ADD_<unit>S.
+        self.validate_all(
+            "SELECT ADD_DAYS(d, 1) FROM t",
+            read={
+                "postgres": "SELECT d + INTERVAL '1 day' FROM t",
+                "mysql": "SELECT d + INTERVAL 1 DAY FROM t",
+            },
+        )
+        self.validate_all(
+            "SELECT ADD_MONTHS(d, 3) FROM t",
+            read={"postgres": "SELECT INTERVAL '3 months' + d FROM t"},
+        )
+        self.validate_all(
+            "SELECT ADD_YEARS(d, -1) FROM t",
+            read={"postgres": "SELECT d - INTERVAL '1 year' FROM t"},
+        )
+        self.validate_all(
+            "SELECT ADD_SECONDS(d, 5400) FROM t",
+            read={"postgres": "SELECT d + INTERVAL '90 minutes' FROM t"},
+        )
+        for sql in ("SELECT d + INTERVAL '1 week' FROM t", "SELECT INTERVAL '1 day'"):
+            with self.subTest(sql=sql):
+                with self.assertRaises(UnsupportedError):
+                    parse_one(sql, read="postgres").sql("hana", unsupported_level=ErrorLevel.RAISE)
+
+    def test_date_trunc(self):
+        # HANA has no DATE_TRUNC; SERIES_ROUND rounding down to a one-unit interval truncates.
+        self.validate_all(
+            "SELECT SERIES_ROUND(d, 'INTERVAL 1 MONTH', ROUND_DOWN) FROM t",
+            read={
+                "postgres": "SELECT DATE_TRUNC('month', d) FROM t",
+                "bigquery": "SELECT DATE_TRUNC(d, MONTH) FROM t",
+            },
+        )
+        self.validate_all(
+            "SELECT SERIES_ROUND(d, 'INTERVAL 3 MONTH', ROUND_DOWN) FROM t",
+            read={"bigquery": "SELECT DATE_TRUNC(d, QUARTER) FROM t"},
+        )
+        # SERIES_ROUND aligns intervals to a fixed origin, so a 7-day interval doesn't start on Monday.
+        with self.assertRaises(UnsupportedError):
+            parse_one("SELECT DATE_TRUNC('week', d) FROM t", read="postgres").sql(
+                "hana", unsupported_level=ErrorLevel.RAISE
+            )
+
+    def test_split_part_is_unsupported(self):
+        with self.assertRaises(UnsupportedError):
+            parse_one("SELECT SPLIT_PART(a, ',', 2) FROM t", read="postgres").sql(
                 "hana", unsupported_level=ErrorLevel.RAISE
             )

@@ -40,6 +40,17 @@ EXTRACT_FUNCTION_BY_PART = {
 # expressed in seconds instead. Same rewrite Hibernate's HANADialect uses.
 SECONDS_PER_UNIT = {"HOUR": 3600, "MINUTE": 60}
 
+# DATE_TRUNC units that SERIES_ROUND can express as a single interval.
+TRUNC_INTERVAL_BY_UNIT = {
+    "YEAR": "INTERVAL 1 YEAR",
+    "QUARTER": "INTERVAL 3 MONTH",
+    "MONTH": "INTERVAL 1 MONTH",
+    "DAY": "INTERVAL 1 DAY",
+    "HOUR": "INTERVAL 1 HOUR",
+    "MINUTE": "INTERVAL 1 MINUTE",
+    "SECOND": "INTERVAL 1 SECOND",
+}
+
 # The interval-adding and interval-subtracting expressions this dialect routes through one
 # pair of helpers. All are exp.Func subclasses carrying `this`, `expression` and `unit`.
 DateDelta = t.Union[
@@ -178,10 +189,13 @@ def _hash_sql(self: HanaGenerator, func_name: str, this: exp.Expr) -> str:
     Two conversions are needed, in both directions: HASH_MD5 / HASH_SHA256 take a BINARY argument,
     and they RETURN a VARBINARY, whereas every other dialect's MD5()/SHA2() returns the hex text.
     BINTOHEX closes that second half -- without it the value is binary, not the hex digest, and
-    comparing it against a hex literal silently never matches.
+    comparing it against a hex literal silently never matches. BINTOHEX emits uppercase digits
+    while other engines' hex digests are lowercase, hence the LOWER.
     https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/hash-md5-function-miscellaneous
     """
-    return self.func("BINTOHEX", exp.func(func_name, exp.func("TO_BINARY", this)))
+    return self.func(
+        "LOWER", exp.func("BINTOHEX", exp.func(func_name, exp.func("TO_BINARY", this)))
+    )
 
 
 def _md5_sql(self: HanaGenerator, expression: exp.MD5) -> str:
@@ -303,6 +317,20 @@ def _date_sub_sql(self: HanaGenerator, expression: DateDelta) -> str:
     )
 
 
+def _interval_to_date_add(this: exp.Expr, interval: exp.Interval) -> exp.DateAdd:
+    # INTERVAL '1' DAY carries its amount as a string, which ADD_<unit>S would take as text.
+    amount = interval.this
+    if amount.is_string and amount.name.lstrip("-").isdigit():
+        amount = exp.Literal.number(amount.name)
+
+    # Postgres-style INTERVAL '2 hours' keeps the plural unit.
+    unit = interval.text("unit").upper()
+    if unit.endswith("S") and (unit[:-1] in DATE_UNITS or unit[:-1] in SECONDS_PER_UNIT):
+        unit = unit[:-1]
+
+    return exp.DateAdd(this=this, expression=amount, unit=exp.var(unit))
+
+
 def _date_diff_sql(self: HanaGenerator, expression: DateDelta) -> str:
     unit = expression.text("unit").upper() or "DAY"
 
@@ -312,27 +340,51 @@ def _date_diff_sql(self: HanaGenerator, expression: DateDelta) -> str:
 
     seconds = SECONDS_PER_UNIT.get(unit)
     if seconds:
-        # No HOURS_BETWEEN / MINUTES_BETWEEN in HANA, so divide SECONDS_BETWEEN -- but HANA's
-        # `/` is true division, so the quotient has to be truncated explicitly.
-        #
-        # ROUND(<x>, 0, ROUND_DOWN) rather than a bare CAST: converting a fractional value to an
-        # integer type ROUNDS in HANA, which would report a whole extra unit past the half-way
-        # mark (1h31m as 2 hours). ROUND_DOWN truncates toward zero, which is what a difference
-        # in whole units means -- and unlike FLOOR it is also right when the difference is
-        # negative, where flooring -1.5 would give -2 rather than -1.
-        # This measures elapsed whole units rather than counting boundary crossings the way
-        # T-SQL's DATEDIFF does.
+        # No HOURS_BETWEEN / MINUTES_BETWEEN in HANA, so divide SECONDS_BETWEEN. HANA's `/` is
+        # true division, and casting the quotient to an integer type truncates toward zero, which
+        # is what a difference in whole units means (1h31m is 1 hour, -1h31m is -1). This
+        # measures elapsed whole units rather than counting boundary crossings the way T-SQL's
+        # DATEDIFF does.
         divided = exp.Div(
             this=exp.func("SECONDS_BETWEEN", start, end), expression=exp.Literal.number(seconds)
         )
-        truncated = exp.func("ROUND", divided, exp.Literal.number(0), exp.var("ROUND_DOWN"))
-        return self.sql(exp.cast(truncated, exp.DType.BIGINT))
+        return self.sql(exp.cast(divided, exp.DType.BIGINT))
 
     if unit not in DATE_UNITS:
         self.unsupported(f"{unit}S_BETWEEN does not exist in SAP HANA.")
         return self.function_fallback_sql(expression)
 
     return self.func(f"{unit}S_BETWEEN", start, end)
+
+
+def _date_trunc_sql(self: HanaGenerator, expression: exp.DateTrunc | exp.TimestampTrunc) -> str:
+    """HANA has no DATE_TRUNC; SERIES_ROUND rounding down to a one-unit interval truncates.
+
+    Week truncation is refused: SERIES_ROUND aligns intervals to a fixed origin, so a 7-day
+    interval does not start on a Monday.
+    https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-sql-reference-guide/series-round-function-series-data
+    """
+    unit = expression.text("unit").upper()
+    interval = TRUNC_INTERVAL_BY_UNIT.get(unit)
+
+    if not interval:
+        self.unsupported(f"Truncating to {unit or 'an unknown unit'} is not supported in SAP HANA.")
+        return self.function_fallback_sql(expression)
+
+    return self.func(
+        "SERIES_ROUND", expression.this, exp.Literal.string(interval), exp.var("ROUND_DOWN")
+    )
+
+
+def _add_dummy_from(expression: exp.Expr) -> exp.Expr:
+    # Every SELECT needs a FROM clause in SAP HANA; DUMMY is its one-row table.
+    if (
+        isinstance(expression, exp.Select)
+        and expression.expressions
+        and not expression.args.get("from_")
+    ):
+        expression.set("from_", exp.From(this=exp.to_table("DUMMY")))
+    return expression
 
 
 class HanaGenerator(generator.Generator):
@@ -402,6 +454,7 @@ class HanaGenerator(generator.Generator):
         exp.DateDiff: _date_diff_sql,
         exp.DatetimeDiff: _date_diff_sql,
         exp.DateSub: _date_sub_sql,
+        exp.DateTrunc: _date_trunc_sql,
         exp.DatetimeAdd: _date_add_sql,
         exp.DatetimeSub: _date_sub_sql,
         # SAP HANA spells these without separators, unlike sqlglot's default rendering.
@@ -436,6 +489,7 @@ class HanaGenerator(generator.Generator):
         exp.TimestampAdd: _date_add_sql,
         exp.TimestampDiff: _date_diff_sql,
         exp.TimestampSub: _date_sub_sql,
+        exp.TimestampTrunc: _date_trunc_sql,
         exp.ToChar: _to_varchar_sql,
         exp.Trim: _trim_sql,
         exp.TsOrDsAdd: _date_add_sql,
@@ -448,12 +502,52 @@ class HanaGenerator(generator.Generator):
         # into constructs that do rather than emitted verbatim.
         exp.Select: transforms.preprocess(
             [
+                _add_dummy_from,
                 transforms.eliminate_distinct_on,
                 transforms.eliminate_qualify,
                 transforms.eliminate_semi_and_anti_joins,
             ]
         ),
     }
+
+    def md5digest_sql(self, expression: exp.MD5Digest) -> str:
+        # The binary digest is what HASH_MD5 returns natively; only the input needs converting.
+        return self.func("HASH_MD5", exp.func("TO_BINARY", expression.this))
+
+    def sha2digest_sql(self, expression: exp.SHA2Digest) -> str:
+        length = expression.text("length") or "256"
+        if length != "256":
+            self.unsupported(f"SHA2 with length {length} is not supported in SAP HANA.")
+            return self.function_fallback_sql(expression)
+
+        return self.func("HASH_SHA256", exp.func("TO_BINARY", expression.this))
+
+    def splitpart_sql(self, expression: exp.SplitPart) -> str:
+        self.unsupported("SAP HANA has no SPLIT_PART function.")
+        return self.function_fallback_sql(expression)
+
+    def interval_sql(self, expression: exp.Interval) -> str:
+        # Interval arithmetic is rewritten in add_sql / sub_sql; anywhere else it has no HANA form.
+        self.unsupported("SAP HANA does not support INTERVAL literals.")
+        return super().interval_sql(expression)
+
+    def add_sql(self, expression: exp.Add) -> str:
+        # HANA has no INTERVAL type, so `<date> + INTERVAL ...` becomes ADD_<unit>S.
+        this, interval = expression.this, expression.expression
+        if isinstance(this, exp.Interval):
+            this, interval = interval, this
+
+        if isinstance(interval, exp.Interval) and interval.unit:
+            return _date_add_sql(self, _interval_to_date_add(this, interval))
+
+        return super().add_sql(expression)
+
+    def sub_sql(self, expression: exp.Sub) -> str:
+        interval = expression.expression
+        if isinstance(interval, exp.Interval) and interval.unit:
+            return _date_sub_sql(self, _interval_to_date_add(expression.this, interval))
+
+        return super().sub_sql(expression)
 
     def datatype_sql(self, expression: exp.DataType) -> str:
         """Route an unbounded binary type to BLOB.
