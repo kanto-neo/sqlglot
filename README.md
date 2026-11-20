@@ -614,6 +614,7 @@ Without dateutil, the optimizer leaves this arithmetic unevaluated.
 | Dune | Community |
 | Exasol | Community |
 | Fabric | Community |
+| HANA | Community |
 | Hive | Official |
 | Materialize | Community |
 | MySQL | Official |
